@@ -1241,10 +1241,10 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, void*) {
     return TRUE;
 }
 
-extern "C" __declspec(dllexport) HRESULT WINAPI DllGetClassObject(
+STDAPI DllGetClassObject(
     REFCLSID classId,
     REFIID interfaceId,
-    void** result) {
+    LPVOID* result) {
     try {
         if (classId != kChameleonBarTap) {
             return CLASS_E_CLASSNOTAVAILABLE;
@@ -1257,6 +1257,6 @@ extern "C" __declspec(dllexport) HRESULT WINAPI DllGetClassObject(
     }
 }
 
-extern "C" __declspec(dllexport) HRESULT WINAPI DllCanUnloadNow() {
+STDAPI DllCanUnloadNow() {
     return winrt::get_module_lock() ? S_FALSE : S_OK;
 }

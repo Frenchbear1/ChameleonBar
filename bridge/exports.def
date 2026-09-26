@@ -1,0 +1,5 @@
+LIBRARY "ChameleonBar.XamlBridge"
+
+EXPORTS
+    DllGetClassObject
+    DllCanUnloadNow

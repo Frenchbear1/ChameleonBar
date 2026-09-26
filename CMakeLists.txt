@@ -19,17 +19,20 @@ add_executable(ChameleonBar WIN32
     src/xaml_bridge_client.cpp
 )
 target_include_directories(ChameleonBar PRIVATE src)
-target_compile_definitions(ChameleonBar PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN)
+target_compile_definitions(ChameleonBar PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(ChameleonBar PRIVATE
     user32 gdi32 shell32 dwmapi advapi32 ole32 uuid comctl32 uxtheme
 )
 
-add_library(ChameleonBarXamlBridge SHARED bridge/xaml_bridge.cpp)
+add_library(ChameleonBarXamlBridge SHARED
+    bridge/xaml_bridge.cpp
+    bridge/exports.def
+)
 set_target_properties(ChameleonBarXamlBridge PROPERTIES
     OUTPUT_NAME "ChameleonBar.XamlBridge"
     PREFIX ""
 )
-target_compile_definitions(ChameleonBarXamlBridge PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN)
+target_compile_definitions(ChameleonBarXamlBridge PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(ChameleonBarXamlBridge PRIVATE
     ole32 oleaut32 runtimeobject gdi32 user32 uuid
 )
@@ -41,7 +44,7 @@ add_executable(sampler_tests
     src/window_activity.cpp
 )
 target_include_directories(sampler_tests PRIVATE src)
-target_compile_definitions(sampler_tests PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN)
+target_compile_definitions(sampler_tests PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(sampler_tests PRIVATE user32 dwmapi)
 
 enable_testing()

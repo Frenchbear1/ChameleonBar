@@ -28,16 +28,17 @@ $IconResource = Join-Path $Build 'ChameleonBar-icon.res'
     (Join-Path $Root 'assets\chameleonbar.ico') $IconResource
 if ($LASTEXITCODE -ne 0) { throw 'Application icon resource build failed.' }
 
-& $Compiler --target=x86_64-w64-mingw32 -std=c++23 -O2 -shared -Wall -Wextra `
+& $Compiler --target=x86_64-w64-mingw32 -std=c++23 -O2 -shared -Wall -Wextra -DNOMINMAX `
     -Wno-dll-attribute-on-redeclaration `
     -I 'C:\Program Files\Windhawk\Compiler\include' `
     (Join-Path $Root 'bridge\xaml_bridge.cpp') `
+    (Join-Path $Root 'bridge\exports.def') `
     -static -static-libgcc -static-libstdc++ `
     -lole32 -loleaut32 -lruntimeobject -lgdi32 -luser32 -luuid `
     -o (Join-Path $Build 'ChameleonBar.XamlBridge.dll')
 if ($LASTEXITCODE -ne 0) { throw 'Local XAML bridge build failed.' }
 
-& $Compiler --target=x86_64-w64-mingw32 -std=c++20 -O2 -Wall -Wextra `
+& $Compiler --target=x86_64-w64-mingw32 -std=c++20 -O2 -Wall -Wextra -DNOMINMAX `
     -I (Join-Path $Root 'src') `
     (Join-Path $Root 'tests\sampler_tests.cpp') `
     (Join-Path $Root 'src\color_sampler.cpp') `
@@ -51,7 +52,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Sampler test build failed.' }
 & (Join-Path $Build 'sampler_tests.exe')
 if ($LASTEXITCODE -ne 0) { throw 'Sampler tests failed.' }
 
-& $Compiler --target=x86_64-w64-mingw32 -std=c++20 -O2 -Wall -Wextra `
+& $Compiler --target=x86_64-w64-mingw32 -std=c++20 -O2 -Wall -Wextra -DNOMINMAX `
     -municode -mwindows `
     -I (Join-Path $Root 'src') `
     (Join-Path $Root 'src\main.cpp') `
