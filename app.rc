@@ -1,0 +1,3 @@
+#include "src/resource.h"
+
+IDI_CHAMELEONBAR ICON "assets/chameleonbar.ico"
