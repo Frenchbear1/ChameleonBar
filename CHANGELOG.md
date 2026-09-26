@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.1 local preview
+
+- Keep `Instant` sampling to a single one-shot request at a time and yield between completed frames so input and paint messages cannot be starved.
+- Restart the sampling scheduler only when the update-interval control actually changes.
+- Debounce settings-file writes during slider drags, then flush them when interaction stops or the settings window closes.
+
 ## 0.9 local preview
 
 - Remove the experimental Animations page and its window-capture/overlay code.

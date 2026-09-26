@@ -35,6 +35,7 @@ constexpr UINT kTrayMessage = WM_APP + 41;
 constexpr UINT kShowSettingsMessage = WM_APP + 42;
 constexpr UINT_PTR kSamplingTimer = 1;
 constexpr UINT_PTR kTestExitTimer = 2;
+constexpr UINT_PTR kSettingsSaveTimer = 3;
 
 constexpr UINT kMenuPause = 1001;
 constexpr UINT kMenuOpenWindow = 1000;
@@ -1064,7 +1065,10 @@ private:
         auto* self = static_cast<Application*>(parameter);
         if (self && self->window_ &&
             !self->immediateSamplePending_.exchange(true)) {
-            PostMessageW(self->window_, kImmediateSamplingMessage, 0, 0);
+            if (!PostMessageW(
+                    self->window_, kImmediateSamplingMessage, 0, 0)) {
+                self->immediateSamplePending_ = false;
+            }
         }
     }
 
@@ -1078,32 +1082,55 @@ private:
             immediateSamplingTimer_ = nullptr;
         }
         immediateSamplePending_ = false;
+        scheduledIntervalMilliseconds_ = -1;
     }
 
     void UpdateSamplingSchedule() {
+        const int desiredInterval = tuning_.intervalMilliseconds;
+        if (scheduledIntervalMilliseconds_ == desiredInterval &&
+            (desiredInterval != 0 || immediateSamplingTimer_)) {
+            return;
+        }
         StopSamplingSchedule();
         if (!window_) {
             return;
         }
-        if (tuning_.intervalMilliseconds == 0) {
-            CreateTimerQueueTimer(
+        if (desiredInterval == 0) {
+            if (CreateTimerQueueTimer(
                 &immediateSamplingTimer_,
                 nullptr,
                 ImmediateSamplingCallback,
                 this,
                 0,
                 1,
-                WT_EXECUTEDEFAULT);
+                WT_EXECUTEDEFAULT)) {
+                scheduledIntervalMilliseconds_ = desiredInterval;
+            }
         } else {
-            SetTimer(
+            if (SetTimer(
                 window_, kSamplingTimer,
-                tuning_.intervalMilliseconds, nullptr);
+                desiredInterval, nullptr)) {
+                scheduledIntervalMilliseconds_ = desiredInterval;
+            }
         }
+    }
+
+    void QueueSettingsSave() {
+        if (window_) {
+            SetTimer(window_, kSettingsSaveTimer, 180, nullptr);
+        }
+    }
+
+    void SaveSettingsNow() {
+        if (window_) {
+            KillTimer(window_, kSettingsSaveTimer);
+        }
+        chameleon::SaveSettings(settings_);
     }
 
     void ApplySettingsLive() {
         tuning_ = chameleon::TuningForSettings(settings_);
-        chameleon::SaveSettings(settings_);
+        QueueSettingsSave();
         UpdateSamplingSchedule();
         for (const auto& backdrop : backdrops_) {
             SetTaskbarTransparent(
@@ -1212,6 +1239,7 @@ private:
 
     void HideSettingsWindow() {
         if (window_) {
+            SaveSettingsNow();
             ShowWindow(window_, SW_HIDE);
         }
     }
@@ -1593,7 +1621,7 @@ private:
 
     void ShowAbout() {
         const std::wstring message =
-            L"ChameleonBar local preview 0.9\n\n"
+            L"ChameleonBar local preview 0.9.1\n\n"
             L"Current sampling style: " + chameleon::PresetName(settings_.preset) +
             L"\n\nEach small taskbar segment follows the screen area directly beside it. "
             L"Split-screen boundaries remain sharp; text, cursors, and local video motion are stabilized. "
@@ -2081,11 +2109,15 @@ private:
                 self->Sample();
             } else if (wParam == kTestExitTimer) {
                 DestroyWindow(window);
+            } else if (wParam == kSettingsSaveTimer) {
+                self->SaveSettingsNow();
             }
             return 0;
         case kImmediateSamplingMessage:
+            if (self->tuning_.intervalMilliseconds == 0) {
+                self->Sample();
+            }
             self->immediateSamplePending_ = false;
-            self->Sample();
             return 0;
         case WM_COMMAND:
             self->HandleCommand(LOWORD(wParam), HIWORD(wParam));
@@ -2105,6 +2137,7 @@ private:
             return 0;
         case WM_DESTROY:
             self->StopSamplingSchedule();
+            self->SaveSettingsNow();
             self->DeactivateBridge();
             self->RestoreTaskbars();
             self->RemoveTrayIcon();
@@ -2157,6 +2190,7 @@ private:
     bool sampleLogged_ = false;
     HANDLE immediateSamplingTimer_ = nullptr;
     std::atomic_bool immediateSamplePending_{false};
+    int scheduledIntervalMilliseconds_ = -1;
     std::wstring testLogPath_;
     HANDLE activeEvent_ = nullptr;
     chameleon::BridgeAttachResult bridgeResult_{};

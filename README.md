@@ -30,7 +30,7 @@ The settings popup applies changes immediately and saves them automatically.
 - **Ignore foreground details up to**: controls the maximum width of a removable detail, now up to `192 px`. Every visible application's outer edges are hard boundaries, so a wide cleanup radius stays inside that window and cannot spread its color through a desktop gap or into a neighboring app.
 - **Horizontal segment width**: trades maximum spatial precision for lower CPU use.
 - **Split-window edge protection**: prevents colors from bleeding across strong window boundaries.
-- **Update interval**: controls responsiveness and CPU use. `Instant` runs the next sample as soon as the previous one finishes, with message coalescing so stale frames never queue up.
+- **Update interval**: controls responsiveness and CPU use. `Instant` starts the next sample after the previous one finishes, while reserving a brief message-queue handoff so slider input and painting remain responsive and stale sample frames never queue up.
 - **Adaptive contrast**: switches the tray arrow, network, volume, battery, clock, date, notifications, and each running-app underline between light and dark.
 - **Separate light/dark thresholds**: create hysteresis so foreground colors do not flicker near the cutoff.
 - **Start with Windows** starts the utility after sign-in. **When ChameleonBar starts, show only its tray icon** means it begins running without opening the settings window; double-click its chameleon icon to show settings.
