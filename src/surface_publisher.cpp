@@ -1,5 +1,7 @@
 #include "surface_publisher.h"
 
+#include <sddl.h>
+
 #include <algorithm>
 #include <cstring>
 
@@ -11,6 +13,26 @@ std::uint64_t HandleKey(HWND window) {
 }
 
 }  // namespace
+
+SharedObjectSecurity::SharedObjectSecurity() {
+    // SYSTEM, Administrators, the owner and the interactive user get full
+    // access; the medium integrity label still blocks low-integrity writers.
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)(A;;GA;;;IU)S:(ML;;NW;;;ME)",
+            SDDL_REVISION_1, &descriptor_, nullptr)) {
+        attributes_.nLength = sizeof(attributes_);
+        attributes_.lpSecurityDescriptor = descriptor_;
+        attributes_.bInheritHandle = FALSE;
+    } else {
+        descriptor_ = nullptr;
+    }
+}
+
+SharedObjectSecurity::~SharedObjectSecurity() {
+    if (descriptor_) {
+        LocalFree(descriptor_);
+    }
+}
 
 SurfacePublisher::~SurfacePublisher() {
     if (state_) {
@@ -25,13 +47,19 @@ bool SurfacePublisher::Initialize() {
     if (state_) {
         return true;
     }
+    SharedObjectSecurity security;
     mapping_ = CreateFileMappingW(
         INVALID_HANDLE_VALUE,
-        nullptr,
+        security.get(),
         PAGE_READWRITE,
         0,
         static_cast<DWORD>(sizeof(SharedSurfaceState)),
         kSurfaceMappingName);
+    if (!mapping_ && security.get()) {
+        mapping_ = CreateFileMappingW(
+            INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+            static_cast<DWORD>(sizeof(SharedSurfaceState)), kSurfaceMappingName);
+    }
     if (!mapping_) {
         return false;
     }

@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.0
+
+### Fixed
+- **The color no longer disappears when you open Start, Quick Settings or click the taskbar.** The bridge used to overwrite the native `BackgroundFill`, which Windows' visual states replace whenever those flyouts open or the taskbar takes focus. It now paints its own overlay element directly above the native background, which Windows never restyles.
+- Removed a constant fight inside Explorer: the old guard re-applied the brush up to 30 times a second and wrote `settings.ini` from Explorer's UI thread each time, causing taskbar jank.
+- Explorer no longer screen-captures the tray 30 times a second; contrast is computed from the published pixels.
+- Removed `CAPTUREBLT` from screen sampling, which made the mouse cursor flicker on many systems.
+- Shared-memory slots are released and reclaimed, so taskbars keep getting color after Explorer restarts or monitors are reconnected.
+- The bridge now retries for two minutes if Explorer isn't ready yet (sign-in with "Start with Windows") and reconnects automatically after Explorer restarts.
+- Taskbars are matched to their XAML islands directly, fixing swapped or missing colors on multi-monitor setups with identical displays.
+- The taskbar is left untouched (instead of turning transparent) until ChameleonBar has published colors for it.
+- Replaced the 1 ms "Instant" spin timer with a normal 16 ms (60 fps) minimum update rate.
+
+### New
+- Seven presets: Seamless, Soft blend, Ambient glow, Cinema, Vivid, Muted and Battery saver. Custom is selected automatically when you change a slider and deselected when you return to a preset's values.
+- Redesigned settings window: sidebar navigation, preset cards, live preview of the taskbar strip, antialiased controls, per-monitor DPI scaling, follows Windows light/dark mode, full keyboard navigation.
+- An honest status card (Live / Connecting / Needs attention / Paused) driven by a heartbeat from the bridge.
+- Restart Explorer action in the window and tray menu.
+- Clear-desktop mode keeps tray contrast adapting to the wallpaper.
+
+### Changed
+- Settings store the preset by name. Older preview settings are migrated automatically; the retired Instant interval becomes 16 ms.
+- Shared-memory, event and bridge names are versioned so an older dormant bridge in Explorer can't interfere.
+
 ## 0.9.1 local preview
 
 - Keep `Instant` sampling to a single one-shot request at a time and yield between completed frames so input and paint messages cannot be starved.

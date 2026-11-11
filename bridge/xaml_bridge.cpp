@@ -17,7 +17,9 @@
 // Nothing here captures the screen or touches the disk; all data arrives over
 // a small shared-memory mapping.
 
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 
 #include <windows.h>
 #include <ocidl.h>
@@ -403,11 +405,44 @@ void RegisterXamlSource(hosting::DesktopWindowXamlSource const& source) {
     g_xamlSources.push_back({winrt::make_weak(source), root});
 }
 
+HWND ResolveTaskbarWindowUncached(wux::XamlRoot const& root);
+
+// Every tray, underline and background in one taskbar shares a XamlRoot, so
+// resolve each root once and reuse the answer for a few seconds.
+struct RootResolution {
+    void* root = nullptr;
+    HWND taskbar = nullptr;
+    ULONGLONG resolvedAt = 0;
+};
+thread_local std::vector<RootResolution> g_rootResolutions;
+
 HWND ResolveTaskbarWindow(wux::UIElement const& element) {
     const auto root = element.XamlRoot();
     if (!root) {
         return nullptr;
     }
+    void* key = winrt::get_abi(root);
+    const ULONGLONG now = GetTickCount64();
+    for (auto& entry : g_rootResolutions) {
+        if (entry.root == key) {
+            if (entry.taskbar && IsWindow(entry.taskbar) &&
+                now - entry.resolvedAt < kTaskbarResolveMilliseconds) {
+                return entry.taskbar;
+            }
+            entry.taskbar = ResolveTaskbarWindowUncached(root);
+            entry.resolvedAt = now;
+            return entry.taskbar;
+        }
+    }
+    std::erase_if(g_rootResolutions, [now](const RootResolution& entry) {
+        return now - entry.resolvedAt > 60000;
+    });
+    const HWND taskbar = ResolveTaskbarWindowUncached(root);
+    g_rootResolutions.push_back({key, taskbar, now});
+    return taskbar;
+}
+
+HWND ResolveTaskbarWindowUncached(wux::XamlRoot const& root) {
 
     // Exact: the DesktopWindowXamlSource that hosts this XamlRoot.
     for (const auto& record : g_xamlSources) {

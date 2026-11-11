@@ -16,6 +16,24 @@ struct BridgeHealth {
     int indicators = 0;
 };
 
+// Security attributes for the shared mapping and fail-safe event. They let the
+// non-elevated Explorer reach both objects even when ChameleonBar itself was
+// started as administrator (whose default DACL would lock Explorer out).
+class SharedObjectSecurity {
+public:
+    SharedObjectSecurity();
+    ~SharedObjectSecurity();
+    SharedObjectSecurity(const SharedObjectSecurity&) = delete;
+    SharedObjectSecurity& operator=(const SharedObjectSecurity&) = delete;
+
+    // Null when the descriptor could not be built (defaults are used then).
+    SECURITY_ATTRIBUTES* get() { return descriptor_ ? &attributes_ : nullptr; }
+
+private:
+    PSECURITY_DESCRIPTOR descriptor_ = nullptr;
+    SECURITY_ATTRIBUTES attributes_{};
+};
+
 class SurfacePublisher {
 public:
     SurfacePublisher() = default;

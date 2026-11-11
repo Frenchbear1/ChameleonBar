@@ -412,8 +412,14 @@ public:
         if (colors.empty()) {
             return false;
         }
-        if (publisher_) {
+        // Identical frames are not republished, so Explorer does no work while
+        // the screen is static. A periodic refresh keeps the slot fresh.
+        const ULONGLONG now = GetTickCount64();
+        const bool unchanged = mode == lastMode_ && colors == lastColors_ &&
+                               now - lastPublishTick_ < 1000;
+        if (publisher_ && !unchanged) {
             publisher_->Publish(taskbar_, geometry.taskbar, geometry.horizontal, colors, mode);
+            lastPublishTick_ = now;
         }
         lastColors_ = std::move(colors);
         lastMode_ = mode;
@@ -505,6 +511,7 @@ private:
     chameleon::TemporalFilter temporal_;
     std::vector<std::uint32_t> lastColors_;
     chameleon::SurfaceMode lastMode_ = chameleon::kSurfaceNative;
+    ULONGLONG lastPublishTick_ = 0;
     bool frozen_ = false;
 };
 
@@ -530,7 +537,11 @@ public:
         settingsWindow_ = std::make_unique<chameleon::SettingsWindow>(g_instance, this);
 
         if (!testRun_) {
-            activeEvent_ = CreateEventW(nullptr, TRUE, TRUE, chameleon::kActiveEventName);
+            chameleon::SharedObjectSecurity security;
+            activeEvent_ = CreateEventW(security.get(), TRUE, TRUE, chameleon::kActiveEventName);
+            if (!activeEvent_) {
+                activeEvent_ = CreateEventW(nullptr, TRUE, TRUE, chameleon::kActiveEventName);
+            }
             AttachBridge();
             if (!bridgeResult_.attached && bridgeResult_.retryable) {
                 StartBridgeRetries();
