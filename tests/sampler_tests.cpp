@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "../src/color_sampler.h"
+#include "../src/settings.h"
 #include "../src/surface_publisher.h"
 #include "../src/window_activity.h"
 
@@ -489,7 +490,7 @@ void SharedSurfacePublishesExactPixels() {
             return slot.taskbarWindow == handle;
         });
     Require(iterator != std::end(state->slots), "published taskbar slot exists");
-    Require(iterator->visible == 1, "published taskbar surface is visible");
+    Require(iterator->mode == chameleon::kSurfaceImage, "published taskbar surface is an image");
     Require(
         iterator->pixelWidth == 4 && iterator->pixelHeight == 1 &&
             iterator->pixelCount == 4,
@@ -497,9 +498,58 @@ void SharedSurfacePublishesExactPixels() {
     Require(
         std::equal(pixels.begin(), pixels.end(), iterator->pixels),
         "published surface preserves every BGRA pixel");
+    publisher.SetNative(taskbar);
+    Require(iterator->mode == chameleon::kSurfaceNative, "pausing hands the taskbar back to Windows");
+    Require(
+        publisher.Publish(taskbar, rectangle, true, pixels, chameleon::kSurfaceClear),
+        "an empty desktop publishes a clear surface");
+    Require(
+        iterator->mode == chameleon::kSurfaceClear && iterator->pixelCount == 4,
+        "a clear surface still carries pixels for tray contrast");
+
+    publisher.SetContrast(true, 30, 20);
+    Require(
+        state->contrastEnabled == 1 && state->lightThresholdPercent == 30 &&
+            state->darkThresholdPercent == 31,
+        "contrast thresholds are published with hysteresis preserved");
+
+    publisher.Release(taskbar);
+    Require(iterator->taskbarWindow == 0, "a vanished taskbar frees its slot");
+
+    // Explorer restarts create new taskbar windows. Stale slots must be
+    // reclaimed instead of permanently filling the table.
+    for (std::uintptr_t i = 0; i < chameleon::kMaximumTaskbars * 3; ++i) {
+        const HWND fake = reinterpret_cast<HWND>(0x5000 + i * 0x10);
+        Require(publisher.Publish(fake, rectangle, true, pixels),
+                "slots of destroyed taskbars are reused");
+    }
     UnmapViewOfFile(state);
     CloseHandle(mapping);
-    publisher.Hide(taskbar);
+}
+
+void PresetsRoundTrip() {
+    for (const auto& preset : chameleon::Presets()) {
+        chameleon::Settings settings;
+        chameleon::ApplyPreset(settings, preset.id);
+        Require(chameleon::MatchingPreset(settings) == preset.id,
+                "each preset is recognized after it is applied");
+        const auto tuning = chameleon::TuningForSettings(settings);
+        Require(tuning.intervalMilliseconds >= chameleon::kMinimumIntervalMilliseconds,
+                "preset update rates are within the supported range");
+    }
+    chameleon::Settings defaults;
+    Require(chameleon::MatchingPreset(defaults) == chameleon::SamplingPreset::Seamless,
+            "default settings are the Seamless preset");
+    chameleon::Settings custom;
+    chameleon::ApplyPreset(custom, chameleon::SamplingPreset::Vivid);
+    custom.saturationPercent += 1;
+    Require(chameleon::MatchingPreset(custom) == chameleon::SamplingPreset::Custom,
+            "nudging a slider switches to Custom");
+    chameleon::Settings legacyInstant;
+    legacyInstant.intervalMilliseconds = 0;
+    Require(chameleon::TuningForSettings(legacyInstant).intervalMilliseconds ==
+                chameleon::kMinimumIntervalMilliseconds,
+            "the retired Instant interval maps to the fastest supported rate");
 }
 
 }  // namespace
@@ -517,6 +567,7 @@ int main() {
     WideDetailRejectionRespectsApplicationBoundaries();
     DesktopActivityClassification();
     SharedSurfacePublishesExactPixels();
+    PresetsRoundTrip();
     BenchmarkDesktopWidth();
     std::cout << "All ChameleonBar sampler tests passed.\n";
     return 0;

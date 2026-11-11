@@ -4,10 +4,18 @@
 // attachment layer is derived from Windows 11 Taskbar Styler by m417z:
 // https://github.com/ramensoftware/windhawk-mods/blob/main/mods/windows-11-taskbar-styler.wh.cpp
 //
-// Only the behavior ChameleonBar needs is retained: make the native taskbar
-// background and stroke transparent, and keep the native system-tray foreground
-// and running-app indicators readable. No generic selector/style engine, themes,
-// networking, analytics, or Windhawk API dependency is included.
+// What it does inside Explorer:
+//  - Adds one ChameleonBar-owned Rectangle directly above each taskbar's
+//    native BackgroundFill and paints the colors published by ChameleonBar.exe
+//    into it. Windows never styles that element, so opening Start, Search,
+//    Quick Settings or focusing the taskbar cannot override it (the previous
+//    approach set BackgroundFill.Fill, which visual states replace).
+//  - Keeps the system tray, clock and running-app underlines readable by
+//    switching them between light and dark using the published pixels.
+//  - Restores everything as soon as ChameleonBar pauses, exits or crashes.
+//
+// Nothing here captures the screen or touches the disk; all data arrives over
+// a small shared-memory mapping.
 
 #define WIN32_LEAN_AND_MEAN
 
@@ -16,13 +24,13 @@
 #include <xamlom.h>
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <climits>
 #include <cmath>
-#include <cstring>
 #include <cstdint>
+#include <cstring>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <string>
@@ -32,8 +40,10 @@
 
 #include <winrt/base.h>
 #include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Storage.Streams.h>
 #include <winrt/Windows.UI.Xaml.Controls.h>
+#include <winrt/Windows.UI.Xaml.Hosting.h>
 #include <winrt/Windows.UI.Xaml.Media.h>
 #include <winrt/Windows.UI.Xaml.Media.Imaging.h>
 #include <winrt/Windows.UI.Xaml.Shapes.h>
@@ -44,6 +54,7 @@
 namespace wf = winrt::Windows::Foundation;
 namespace wux = winrt::Windows::UI::Xaml;
 namespace controls = winrt::Windows::UI::Xaml::Controls;
+namespace hosting = winrt::Windows::UI::Xaml::Hosting;
 namespace media = winrt::Windows::UI::Xaml::Media;
 namespace imaging = winrt::Windows::UI::Xaml::Media::Imaging;
 namespace shapes = winrt::Windows::UI::Xaml::Shapes;
@@ -58,26 +69,29 @@ constexpr GUID kIidBufferByteAccess = {
     0x11df,
     {0x8c, 0x49, 0x00, 0x1e, 0x4f, 0xc6, 0x86, 0xda}};
 
+struct IDesktopWindowXamlSourceNativeAbi : ::IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE AttachToWindow(HWND parent) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_WindowHandle(HWND* window) = 0;
+};
+
+// {3CBCF1BF-2F76-4E9C-96AB-E84B37972554}
+constexpr GUID kIidDesktopWindowXamlSourceNative = {
+    0x3cbcf1bf,
+    0x2f76,
+    0x4e9c,
+    {0x96, 0xab, 0xe8, 0x4b, 0x37, 0x97, 0x25, 0x54}};
+
 namespace {
 
-constexpr wchar_t kActiveEventName[] = L"Local\\ChameleonBar.Active.v4";
-constexpr wchar_t kBridgeReadyEventName[] =
-    L"Local\\ChameleonBar.XamlBridgeReady.v4";
+using chameleon::kSurfaceClear;
+using chameleon::kSurfaceImage;
+using chameleon::kSurfaceNative;
 
-// {7B5E11EE-9EC1-4BA2-AD74-2872EAF766FB}
-constexpr CLSID kChameleonBarTap = {
-    0x7b5e11ee,
-    0x9ec1,
-    0x4ba2,
-    {0xad, 0x74, 0x28, 0x72, 0xea, 0xf7, 0x66, 0xfb}};
-
-UINT WindowDpi(HWND window) {
-    using GetDpiForWindowFunction = UINT(WINAPI*)(HWND);
-    static const auto getDpiForWindow =
-        reinterpret_cast<GetDpiForWindowFunction>(GetProcAddress(
-            GetModuleHandleW(L"user32.dll"), "GetDpiForWindow"));
-    return getDpiForWindow ? getDpiForWindow(window) : 96;
-}
+constexpr wchar_t kOverlayName[] = L"ChameleonBarSurface";
+constexpr auto kActiveInterval = std::chrono::milliseconds(16);
+constexpr auto kIdleInterval = std::chrono::milliseconds(250);
+constexpr ULONGLONG kTaskbarResolveMilliseconds = 3000;
+constexpr ULONGLONG kTrayRefreshMilliseconds = 2000;
 
 HANDLE g_readyEvent;
 
@@ -88,7 +102,9 @@ void DebugLog(const wchar_t* text) {
 }
 
 bool IsChameleonBarActive() {
-    HANDLE event = OpenEventW(SYNCHRONIZE, FALSE, kActiveEventName);
+    // Re-open every time: the event vanishing is the crash fail-safe, and a
+    // cached handle would keep it alive.
+    HANDLE event = OpenEventW(SYNCHRONIZE, FALSE, chameleon::kActiveEventName);
     if (!event) {
         return false;
     }
@@ -97,86 +113,220 @@ bool IsChameleonBarActive() {
     return active;
 }
 
+UINT WindowDpi(HWND window) {
+    using GetDpiForWindowFunction = UINT(WINAPI*)(HWND);
+    static const auto getDpiForWindow =
+        reinterpret_cast<GetDpiForWindowFunction>(reinterpret_cast<void*>(
+            GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetDpiForWindow")));
+    return getDpiForWindow ? getDpiForWindow(window) : 96;
+}
+
+bool IsTaskbarWindow(HWND window) {
+    wchar_t className[64]{};
+    GetClassNameW(window, className, ARRAYSIZE(className));
+    return wcscmp(className, L"Shell_TrayWnd") == 0 ||
+           wcscmp(className, L"Shell_SecondaryTrayWnd") == 0;
+}
+
+// ---------------------------------------------------------------------------
+// Shared surface
+// ---------------------------------------------------------------------------
+
+HANDLE g_surfaceMapping;
+chameleon::SharedSurfaceState* g_surfaceState;
+bool g_surfaceWritable;
+
+bool EnsureSurfaceMapping() {
+    if (g_surfaceState) {
+        return true;
+    }
+    g_surfaceWritable = true;
+    g_surfaceMapping = OpenFileMappingW(
+        FILE_MAP_READ | FILE_MAP_WRITE, FALSE, chameleon::kSurfaceMappingName);
+    if (!g_surfaceMapping) {
+        g_surfaceWritable = false;
+        g_surfaceMapping = OpenFileMappingW(
+            FILE_MAP_READ, FALSE, chameleon::kSurfaceMappingName);
+    }
+    if (!g_surfaceMapping) {
+        return false;
+    }
+    g_surfaceState = static_cast<chameleon::SharedSurfaceState*>(MapViewOfFile(
+        g_surfaceMapping,
+        g_surfaceWritable ? (FILE_MAP_READ | FILE_MAP_WRITE) : FILE_MAP_READ,
+        0,
+        0,
+        sizeof(chameleon::SharedSurfaceState)));
+    if (!g_surfaceState) {
+        CloseHandle(g_surfaceMapping);
+        g_surfaceMapping = nullptr;
+        return false;
+    }
+    return true;
+}
+
+struct SlotCache {
+    HWND taskbar = nullptr;
+    ULONGLONG pulse = 0;
+    bool found = false;
+    LONG mode = kSurfaceNative;
+    LONG revision = LONG_MIN;
+    int pixelWidth = 0;
+    int pixelHeight = 0;
+    std::vector<std::uint32_t> pixels;
+
+    bool HasPixels() const {
+        return found && !pixels.empty() &&
+               static_cast<std::size_t>(pixelWidth) *
+                       static_cast<std::size_t>(pixelHeight) ==
+                   pixels.size();
+    }
+    LONG EffectiveMode() const {
+        return HasPixels() ? mode : kSurfaceNative;
+    }
+};
+
+thread_local std::vector<SlotCache> g_slotCache;
+thread_local ULONGLONG g_pulseNumber;
+
+void RefreshSlot(SlotCache& cache) {
+    if (!EnsureSurfaceMapping() ||
+        g_surfaceState->version != chameleon::kSurfaceProtocolVersion) {
+        cache.found = false;
+        return;
+    }
+    const auto key = static_cast<std::uint64_t>(
+        reinterpret_cast<std::uintptr_t>(cache.taskbar));
+    std::vector<std::uint32_t> pixels;
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        const LONG before = g_surfaceState->sequence;
+        MemoryBarrier();
+        if ((before & 1) != 0) {
+            YieldProcessor();
+            continue;
+        }
+        const chameleon::SharedSurfaceSlot* slot = nullptr;
+        for (const auto& candidate : g_surfaceState->slots) {
+            if (candidate.taskbarWindow == key) {
+                slot = &candidate;
+                break;
+            }
+        }
+        bool found = slot != nullptr;
+        LONG mode = kSurfaceNative;
+        LONG revision = LONG_MIN;
+        int width = 0;
+        int height = 0;
+        bool copied = false;
+        if (slot) {
+            mode = slot->mode;
+            revision = slot->revision;
+            width = std::max(0, static_cast<int>(slot->pixelWidth));
+            height = std::max(0, static_cast<int>(slot->pixelHeight));
+            const int count = std::clamp(
+                static_cast<int>(slot->pixelCount),
+                0,
+                static_cast<int>(chameleon::kMaximumSurfacePixels));
+            if (revision != cache.revision) {
+                pixels.assign(slot->pixels, slot->pixels + count);
+                copied = true;
+            }
+        }
+        MemoryBarrier();
+        if (g_surfaceState->sequence != before) {
+            continue;
+        }
+        cache.found = found;
+        if (found) {
+            cache.mode = mode;
+            cache.revision = revision;
+            cache.pixelWidth = width;
+            cache.pixelHeight = height;
+            if (copied) {
+                cache.pixels = std::move(pixels);
+            }
+        }
+        return;
+    }
+    // The writer was busy every time; keep the previous snapshot.
+}
+
+// The returned reference stays valid until the next SlotFor() call.
+const SlotCache& SlotFor(HWND taskbar) {
+    auto iterator = std::find_if(
+        g_slotCache.begin(), g_slotCache.end(),
+        [taskbar](const SlotCache& cache) { return cache.taskbar == taskbar; });
+    if (iterator == g_slotCache.end()) {
+        g_slotCache.push_back({});
+        g_slotCache.back().taskbar = taskbar;
+        iterator = std::prev(g_slotCache.end());
+    }
+    if (iterator->pulse != g_pulseNumber) {
+        RefreshSlot(*iterator);
+        iterator->pulse = g_pulseNumber;
+    }
+    return *iterator;
+}
+
 struct ContrastSettings {
     bool enabled = true;
     double lightThreshold = 0.18;
     double darkThreshold = 0.26;
 };
 
-std::wstring LocalSettingsPath() {
-    wchar_t localAppData[32768]{};
-    const DWORD length = GetEnvironmentVariableW(
-        L"LOCALAPPDATA", localAppData, ARRAYSIZE(localAppData));
-    if (!length || length >= ARRAYSIZE(localAppData)) {
-        return {};
-    }
-    std::wstring path(localAppData, length);
-    path += L"\\ChameleonBar\\settings.ini";
-    return path;
-}
-
 ContrastSettings ReadContrastSettings() {
     ContrastSettings settings;
-    const std::wstring path = LocalSettingsPath();
-    if (path.empty()) {
+    if (!EnsureSurfaceMapping()) {
         return settings;
     }
-    if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        return settings;
-    }
-
-    settings.enabled =
-        GetPrivateProfileIntW(L"contrast", L"enabled", 1, path.c_str()) != 0;
+    settings.enabled = g_surfaceState->contrastEnabled != 0;
     settings.lightThreshold =
-        std::clamp(static_cast<int>(GetPrivateProfileIntW(
-                       L"contrast", L"light_threshold", 18, path.c_str())),
-                   1, 90) /
-        100.0;
+        std::clamp(static_cast<int>(g_surfaceState->lightThresholdPercent), 1, 90) / 100.0;
     settings.darkThreshold =
-        std::clamp(static_cast<int>(GetPrivateProfileIntW(
-                       L"contrast", L"dark_threshold", 26, path.c_str())),
-                   2, 95) /
-        100.0;
+        std::clamp(static_cast<int>(g_surfaceState->darkThresholdPercent), 2, 95) / 100.0;
     if (settings.darkThreshold <= settings.lightThreshold) {
         settings.darkThreshold = std::min(0.95, settings.lightThreshold + 0.05);
     }
     return settings;
 }
 
-struct TrayContext;
-void WriteTrayDiagnostic(const TrayContext& context);
+// ---------------------------------------------------------------------------
+// Element helpers
+// ---------------------------------------------------------------------------
 
-wux::FrameworkElement ParentElement(wux::FrameworkElement element) {
+wux::FrameworkElement ParentElement(wux::DependencyObject element) {
     return media::VisualTreeHelper::GetParent(element)
         .try_as<wux::FrameworkElement>();
 }
 
-bool HasAncestorClass(wux::FrameworkElement element,
-                      const wchar_t* className,
-                      const wchar_t* excludedName = nullptr) {
+wux::FrameworkElement FindAncestorClass(wux::FrameworkElement element,
+                                        const wchar_t* className,
+                                        const wchar_t* excludedName = nullptr) {
     for (auto parent = ParentElement(element); parent;
          parent = ParentElement(parent)) {
         if (excludedName && parent.Name() == excludedName) {
-            return false;
+            return nullptr;
         }
         if (winrt::get_class_name(parent) == className) {
-            return true;
+            return parent;
         }
     }
-    return false;
+    return nullptr;
+}
+
+bool HasAncestorClass(wux::FrameworkElement element, const wchar_t* className) {
+    return FindAncestorClass(element, className) != nullptr;
 }
 
 void VisitDescendants(
-    wux::FrameworkElement element,
+    wux::DependencyObject element,
     const std::function<void(wux::FrameworkElement)>& callback) {
     const int count = media::VisualTreeHelper::GetChildrenCount(element);
     for (int index = 0; index < count; ++index) {
-        auto child = media::VisualTreeHelper::GetChild(element, index)
-                         .try_as<wux::FrameworkElement>();
-        if (!child) {
-            continue;
+        auto child = media::VisualTreeHelper::GetChild(element, index);
+        if (auto framework = child.try_as<wux::FrameworkElement>()) {
+            callback(framework);
         }
-        callback(child);
         VisitDescendants(child, callback);
     }
 }
@@ -192,262 +342,104 @@ wux::FrameworkElement FindDescendantByName(wux::FrameworkElement element,
     return found;
 }
 
-struct BackgroundOverride {
-    winrt::weak_ref<shapes::Shape> element;
-    media::Brush original{nullptr};
+// Remembers a property's local value so it can be restored exactly, including
+// "never set" (which must be cleared, not set to the current effective value).
+struct SavedLocalValue {
+    bool saved = false;
+    wf::IInspectable value{nullptr};
+
+    void Save(wux::DependencyObject const& element,
+              wux::DependencyProperty const& property) {
+        if (!saved) {
+            value = element.ReadLocalValue(property);
+            saved = true;
+        }
+    }
+    void Restore(wux::DependencyObject const& element,
+                 wux::DependencyProperty const& property) {
+        if (!saved) {
+            return;
+        }
+        if (!value || value == wux::DependencyProperty::UnsetValue()) {
+            element.ClearValue(property);
+        } else {
+            element.SetValue(property, value);
+        }
+        saved = false;
+        value = nullptr;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Taskbar window resolution
+// ---------------------------------------------------------------------------
+
+struct XamlSourceRecord {
+    winrt::weak_ref<hosting::DesktopWindowXamlSource> source;
     HWND taskbar = nullptr;
-    bool overridden = false;
 };
 
-struct SurfaceSnapshot {
-    bool visible = false;
-    int pixelWidth = 0;
-    int pixelHeight = 0;
-    LONG revision = 0;
-    std::vector<std::uint32_t> pixels;
-};
+thread_local std::vector<XamlSourceRecord> g_xamlSources;
 
-struct SurfaceBrushState {
-    HWND taskbar = nullptr;
-    int pixelWidth = 0;
-    int pixelHeight = 0;
-    LONG revision = -1;
-    imaging::WriteableBitmap bitmap{nullptr};
-    media::ImageBrush brush{nullptr};
-};
-
-struct TextForegroundOverride {
-    winrt::weak_ref<controls::TextBlock> element;
-    media::Brush original{nullptr};
-};
-
-struct IconForegroundOverride {
-    winrt::weak_ref<controls::IconElement> element;
-    media::Brush original{nullptr};
-};
-
-struct TrayContext {
-    winrt::weak_ref<wux::FrameworkElement> frame;
-    winrt::weak_ref<wux::FrameworkElement> themeTarget;
-    HWND taskbar = nullptr;
-    wux::ElementTheme originalFrameTheme = wux::ElementTheme::Default;
-    wux::ElementTheme originalTargetTheme = wux::ElementTheme::Default;
-    bool initialized = false;
-    bool lightGlyphs = false;
-    bool overridesApplied = false;
-    double filteredLuminance = 0.0;
-    std::vector<TextForegroundOverride> textTargets;
-    std::vector<IconForegroundOverride> iconTargets;
-};
-
-struct RunningIndicatorOverride {
-    winrt::weak_ref<shapes::Shape> element;
-    media::Brush original{nullptr};
-    media::SolidColorBrush applied{nullptr};
-    HWND taskbar = nullptr;
-    bool initialized = false;
-    bool light = false;
-    bool overridden = false;
-    double filteredLuminance = 0.0;
-};
-
-void WriteTrayDiagnostic(const TrayContext& context) {
-    const std::wstring path = LocalSettingsPath();
-    if (path.empty()) {
+void RegisterXamlSource(hosting::DesktopWindowXamlSource const& source) {
+    winrt::com_ptr<IDesktopWindowXamlSourceNativeAbi> native;
+    if (FAILED(reinterpret_cast<::IUnknown*>(winrt::get_abi(source))
+                   ->QueryInterface(kIidDesktopWindowXamlSourceNative,
+                                    native.put_void()))) {
         return;
     }
-    const std::wstring luminance = std::to_wstring(static_cast<int>(
-        std::lround(context.filteredLuminance * 100.0)));
-    const std::wstring textTargets =
-        std::to_wstring(context.textTargets.size());
-    const std::wstring iconTargets =
-        std::to_wstring(context.iconTargets.size());
-    WritePrivateProfileStringW(
-        L"diagnostics", L"tray_mode",
-        context.lightGlyphs ? L"light" : L"dark", path.c_str());
-    WritePrivateProfileStringW(
-        L"diagnostics", L"tray_luminance_percent", luminance.c_str(),
-        path.c_str());
-    WritePrivateProfileStringW(
-        L"diagnostics", L"tray_text_targets", textTargets.c_str(),
-        path.c_str());
-    WritePrivateProfileStringW(
-        L"diagnostics", L"tray_icon_targets", iconTargets.c_str(),
-        path.c_str());
-}
-
-thread_local std::vector<BackgroundOverride> g_backgrounds;
-thread_local std::vector<SurfaceBrushState> g_surfaceBrushes;
-thread_local std::vector<std::shared_ptr<TrayContext>> g_trays;
-thread_local std::vector<RunningIndicatorOverride> g_runningIndicators;
-thread_local media::SolidColorBrush g_transparentBrush{nullptr};
-thread_local unsigned int g_backgroundGuardCorrections;
-thread_local wux::DispatcherTimer g_pulseTimer{nullptr};
-thread_local winrt::event_token g_pulseToken{};
-thread_local ULONGLONG g_lastSettingsRead;
-thread_local ContrastSettings g_contrastSettings;
-thread_local bool g_applyingBackground;
-thread_local bool g_surfaceDiagnosticWritten;
-HANDLE g_surfaceMapping;
-const chameleon::SharedSurfaceState* g_surfaceState;
-
-bool EnsureSurfaceMapping() {
-    if (g_surfaceState) {
-        return true;
-    }
-    g_surfaceMapping = OpenFileMappingW(
-        FILE_MAP_READ, FALSE, chameleon::kSurfaceMappingName);
-    if (!g_surfaceMapping) {
-        return false;
-    }
-    g_surfaceState = static_cast<const chameleon::SharedSurfaceState*>(
-        MapViewOfFile(
-            g_surfaceMapping,
-            FILE_MAP_READ,
-            0,
-            0,
-            sizeof(chameleon::SharedSurfaceState)));
-    if (!g_surfaceState) {
-        CloseHandle(g_surfaceMapping);
-        g_surfaceMapping = nullptr;
-        return false;
-    }
-    return true;
-}
-
-std::optional<SurfaceSnapshot> ReadSurface(HWND taskbar) {
-    if (!EnsureSurfaceMapping() ||
-        g_surfaceState->version != chameleon::kSurfaceProtocolVersion) {
-        return std::nullopt;
-    }
-    const auto expected = static_cast<std::uint64_t>(
-        reinterpret_cast<std::uintptr_t>(taskbar));
-    for (int attempt = 0; attempt < 3; ++attempt) {
-        const LONG before = g_surfaceState->sequence;
-        MemoryBarrier();
-        if ((before & 1) != 0) {
-            continue;
-        }
-        for (const auto& slot : g_surfaceState->slots) {
-            if (slot.taskbarWindow != expected) {
-                continue;
-            }
-            const int count = std::clamp(
-                static_cast<int>(slot.pixelCount),
-                0,
-                static_cast<int>(chameleon::kMaximumSurfacePixels));
-            SurfaceSnapshot snapshot;
-            snapshot.visible = slot.visible != 0;
-            snapshot.pixelWidth = std::max(0, static_cast<int>(slot.pixelWidth));
-            snapshot.pixelHeight = std::max(0, static_cast<int>(slot.pixelHeight));
-            snapshot.revision = slot.revision;
-            if (snapshot.visible && count > 0 &&
-                snapshot.pixelWidth * snapshot.pixelHeight == count) {
-                snapshot.pixels.assign(slot.pixels, slot.pixels + count);
-            } else if (snapshot.visible) {
-                snapshot.visible = false;
-            }
-            MemoryBarrier();
-            const LONG after = g_surfaceState->sequence;
-            if (before == after && (after & 1) == 0) {
-                return snapshot;
-            }
-            break;
-        }
-        MemoryBarrier();
-        if (before == g_surfaceState->sequence) {
-            return std::nullopt;
-        }
-    }
-    return std::nullopt;
-}
-
-SurfaceBrushState& SurfaceBrushFor(HWND taskbar) {
-    const auto iterator = std::find_if(
-        g_surfaceBrushes.begin(),
-        g_surfaceBrushes.end(),
-        [taskbar](const SurfaceBrushState& state) {
-            return state.taskbar == taskbar;
-        });
-    if (iterator != g_surfaceBrushes.end()) {
-        return *iterator;
-    }
-    g_surfaceBrushes.push_back({});
-    g_surfaceBrushes.back().taskbar = taskbar;
-    return g_surfaceBrushes.back();
-}
-
-media::Brush BrushForSurface(HWND taskbar, const SurfaceSnapshot& snapshot) {
-    if (!snapshot.visible || snapshot.pixels.empty()) {
-        return g_transparentBrush;
-    }
-    auto& state = SurfaceBrushFor(taskbar);
-    if (!state.bitmap || state.pixelWidth != snapshot.pixelWidth ||
-        state.pixelHeight != snapshot.pixelHeight) {
-        state.pixelWidth = snapshot.pixelWidth;
-        state.pixelHeight = snapshot.pixelHeight;
-        state.revision = -1;
-        state.bitmap = imaging::WriteableBitmap(
-            snapshot.pixelWidth, snapshot.pixelHeight);
-        state.brush = media::ImageBrush();
-        state.brush.ImageSource(state.bitmap);
-        state.brush.Stretch(media::Stretch::Fill);
-    }
-    if (state.revision != snapshot.revision) {
-        const auto pixelBuffer = state.bitmap.PixelBuffer();
-        winrt::com_ptr<IBufferByteAccess> byteAccess;
-        winrt::check_hresult(
-            reinterpret_cast<IUnknown*>(winrt::get_abi(pixelBuffer))
-                ->QueryInterface(
-                    kIidBufferByteAccess, byteAccess.put_void()));
-        std::uint8_t* destination = nullptr;
-        winrt::check_hresult(byteAccess->Buffer(&destination));
-        std::memcpy(
-            destination,
-            snapshot.pixels.data(),
-            snapshot.pixels.size() * sizeof(std::uint32_t));
-        state.bitmap.Invalidate();
-        state.revision = snapshot.revision;
-    }
-    return state.brush;
-}
-
-void RecordBackgroundGuardCorrection() {
-    ++g_backgroundGuardCorrections;
-    const std::wstring path = LocalSettingsPath();
-    if (path.empty()) {
+    HWND island = nullptr;
+    if (FAILED(native->get_WindowHandle(&island)) || !island) {
         return;
     }
-    const std::wstring count =
-        std::to_wstring(g_backgroundGuardCorrections);
-    WritePrivateProfileStringW(
-        L"diagnostics", L"background_guard_corrections", count.c_str(),
-        path.c_str());
+    HWND root = GetAncestor(island, GA_ROOT);
+    if (!root || !IsTaskbarWindow(root)) {
+        return;
+    }
+    std::erase_if(g_xamlSources, [&](const XamlSourceRecord& record) {
+        auto alive = record.source.get();
+        return !alive || alive == source;
+    });
+    g_xamlSources.push_back({winrt::make_weak(source), root});
 }
 
-bool IsTaskbarWindow(HWND window) {
-    wchar_t className[64]{};
-    GetClassNameW(window, className, ARRAYSIZE(className));
-    return wcscmp(className, L"Shell_TrayWnd") == 0 ||
-           wcscmp(className, L"Shell_SecondaryTrayWnd") == 0;
-}
-
-HWND ResolveTaskbarWindow(wux::FrameworkElement frame) {
-    const auto root = frame.XamlRoot();
+HWND ResolveTaskbarWindow(wux::UIElement const& element) {
+    const auto root = element.XamlRoot();
     if (!root) {
         return nullptr;
     }
+
+    // Exact: the DesktopWindowXamlSource that hosts this XamlRoot.
+    for (const auto& record : g_xamlSources) {
+        if (!IsWindow(record.taskbar)) {
+            continue;
+        }
+        auto source = record.source.get();
+        if (!source) {
+            continue;
+        }
+        if (auto content = source.Content()) {
+            if (auto contentRoot = content.XamlRoot();
+                contentRoot && contentRoot == root) {
+                return record.taskbar;
+            }
+        }
+    }
+
+    // Fallback: the taskbar in this process whose size and DPI match.
     const auto rootSize = root.Size();
     const double scale = root.RasterizationScale();
-    const int expectedWidth = static_cast<int>(std::lround(rootSize.Width * scale));
-    const int expectedHeight = static_cast<int>(std::lround(rootSize.Height * scale));
-
     struct Search {
         int expectedWidth;
         int expectedHeight;
+        UINT expectedDpi;
         HWND best = nullptr;
-        int bestScore = INT_MAX;
-    } search{expectedWidth, expectedHeight};
+        long long bestScore = LLONG_MAX;
+    } search{
+        static_cast<int>(std::lround(rootSize.Width * scale)),
+        static_cast<int>(std::lround(rootSize.Height * scale)),
+        static_cast<UINT>(std::lround(scale * 96.0)),
+    };
 
     EnumWindows(
         [](HWND window, LPARAM parameter) -> BOOL {
@@ -463,8 +455,11 @@ HWND ResolveTaskbarWindow(wux::FrameworkElement frame) {
             }
             const int width = rect.right - rect.left;
             const int height = rect.bottom - rect.top;
-            const int score = std::abs(width - search->expectedWidth) +
+            long long score = std::abs(width - search->expectedWidth) +
                               std::abs(height - search->expectedHeight);
+            if (WindowDpi(window) != search->expectedDpi) {
+                score += 10000;
+            }
             if (score < search->bestScore) {
                 search->bestScore = score;
                 search->best = window;
@@ -474,6 +469,318 @@ HWND ResolveTaskbarWindow(wux::FrameworkElement frame) {
         reinterpret_cast<LPARAM>(&search));
     return search.best;
 }
+
+// ---------------------------------------------------------------------------
+// Background surface
+// ---------------------------------------------------------------------------
+
+struct SurfaceBrushState {
+    HWND taskbar = nullptr;
+    int pixelWidth = 0;
+    int pixelHeight = 0;
+    LONG revision = LONG_MIN;
+    imaging::WriteableBitmap bitmap{nullptr};
+    media::ImageBrush brush{nullptr};
+};
+
+thread_local std::vector<SurfaceBrushState> g_surfaceBrushes;
+thread_local media::SolidColorBrush g_transparentBrush{nullptr};
+thread_local bool g_applying;
+
+media::Brush TransparentBrush() {
+    if (!g_transparentBrush) {
+        g_transparentBrush = media::SolidColorBrush(
+            winrt::Windows::UI::Color{0, 0, 0, 0});
+    }
+    return g_transparentBrush;
+}
+
+media::Brush BrushForSlot(HWND taskbar, const SlotCache& slot) {
+    auto iterator = std::find_if(
+        g_surfaceBrushes.begin(), g_surfaceBrushes.end(),
+        [taskbar](const SurfaceBrushState& state) { return state.taskbar == taskbar; });
+    if (iterator == g_surfaceBrushes.end()) {
+        g_surfaceBrushes.push_back({});
+        g_surfaceBrushes.back().taskbar = taskbar;
+        iterator = std::prev(g_surfaceBrushes.end());
+    }
+    auto& state = *iterator;
+    if (!state.bitmap || state.pixelWidth != slot.pixelWidth ||
+        state.pixelHeight != slot.pixelHeight) {
+        state.pixelWidth = slot.pixelWidth;
+        state.pixelHeight = slot.pixelHeight;
+        state.revision = LONG_MIN;
+        state.bitmap = imaging::WriteableBitmap(slot.pixelWidth, slot.pixelHeight);
+        state.brush = media::ImageBrush();
+        state.brush.ImageSource(state.bitmap);
+        state.brush.Stretch(media::Stretch::Fill);
+    }
+    if (state.revision != slot.revision) {
+        const auto pixelBuffer = state.bitmap.PixelBuffer();
+        winrt::com_ptr<IBufferByteAccess> byteAccess;
+        winrt::check_hresult(
+            reinterpret_cast<::IUnknown*>(winrt::get_abi(pixelBuffer))
+                ->QueryInterface(kIidBufferByteAccess, byteAccess.put_void()));
+        std::uint8_t* destination = nullptr;
+        winrt::check_hresult(byteAccess->Buffer(&destination));
+        std::memcpy(destination, slot.pixels.data(),
+                    slot.pixels.size() * sizeof(std::uint32_t));
+        state.bitmap.Invalidate();
+        state.revision = slot.revision;
+    }
+    return state.brush;
+}
+
+struct BackgroundTarget {
+    winrt::weak_ref<shapes::Shape> fill;
+    winrt::weak_ref<wux::FrameworkElement> background;  // Taskbar.TaskbarBackground
+    winrt::weak_ref<shapes::Shape> stroke;
+    shapes::Rectangle overlay{nullptr};
+    SavedLocalValue fillOpacity;
+    SavedLocalValue strokeOpacity;
+    SavedLocalValue directFill;  // only when the overlay cannot be inserted
+    bool strokeCallbackRegistered = false;
+    bool hidingNative = false;
+    HWND taskbar = nullptr;
+    ULONGLONG resolvedAt = 0;
+    LONG mode = kSurfaceNative;
+};
+
+thread_local std::vector<std::shared_ptr<BackgroundTarget>> g_backgrounds;
+
+void KeepTransparent(wux::DependencyObject const& sender,
+                     std::weak_ptr<BackgroundTarget> const& weak) {
+    if (g_applying) {
+        return;
+    }
+    auto target = weak.lock();
+    if (!target || !target->hidingNative) {
+        return;
+    }
+    if (auto element = sender.try_as<wux::UIElement>(); element && element.Opacity() != 0.0) {
+        g_applying = true;
+        element.Opacity(0.0);
+        g_applying = false;
+    }
+}
+
+shapes::Shape FindStroke(BackgroundTarget& target) {
+    if (auto stroke = target.stroke.get()) {
+        return stroke;
+    }
+    auto background = target.background.get();
+    if (!background) {
+        return nullptr;
+    }
+    auto stroke = FindDescendantByName(background, L"BackgroundStroke")
+                      .try_as<shapes::Shape>();
+    if (stroke) {
+        target.stroke = winrt::make_weak(stroke);
+        target.strokeOpacity = {};
+        target.strokeCallbackRegistered = false;
+    }
+    return stroke;
+}
+
+void CopyLayout(shapes::Shape const& fill, shapes::Rectangle const& overlay) {
+    overlay.Margin(fill.Margin());
+    overlay.HorizontalAlignment(fill.HorizontalAlignment());
+    overlay.VerticalAlignment(fill.VerticalAlignment());
+    overlay.Width(fill.Width());
+    overlay.Height(fill.Height());
+    controls::Grid::SetRow(overlay, controls::Grid::GetRow(fill));
+    controls::Grid::SetColumn(overlay, controls::Grid::GetColumn(fill));
+    controls::Grid::SetRowSpan(overlay, controls::Grid::GetRowSpan(fill));
+    controls::Grid::SetColumnSpan(overlay, controls::Grid::GetColumnSpan(fill));
+    controls::Canvas::SetZIndex(overlay, controls::Canvas::GetZIndex(fill));
+    if (auto rectangle = fill.try_as<shapes::Rectangle>()) {
+        overlay.RadiusX(rectangle.RadiusX());
+        overlay.RadiusY(rectangle.RadiusY());
+    }
+}
+
+void DetachOverlay(BackgroundTarget& target) {
+    if (!target.overlay) {
+        return;
+    }
+    if (auto panel = media::VisualTreeHelper::GetParent(target.overlay)
+                         .try_as<controls::Panel>()) {
+        uint32_t index = 0;
+        if (panel.Children().IndexOf(target.overlay, index)) {
+            panel.Children().RemoveAt(index);
+        }
+    }
+}
+
+// Places the overlay immediately above the native fill. Returns false when
+// the fill's parent is not a panel (then the direct-fill fallback is used).
+bool EnsureOverlay(BackgroundTarget& target, shapes::Shape const& fill) {
+    auto panel = media::VisualTreeHelper::GetParent(fill).try_as<controls::Panel>();
+    if (!panel) {
+        return false;
+    }
+    auto children = panel.Children();
+    uint32_t fillIndex = 0;
+    if (!children.IndexOf(fill, fillIndex)) {
+        return false;
+    }
+    if (!target.overlay) {
+        target.overlay = shapes::Rectangle();
+        target.overlay.Name(kOverlayName);
+        target.overlay.IsHitTestVisible(false);
+        target.overlay.Fill(TransparentBrush());
+    }
+    uint32_t overlayIndex = 0;
+    if (children.IndexOf(target.overlay, overlayIndex)) {
+        if (overlayIndex == fillIndex + 1) {
+            return true;
+        }
+        children.RemoveAt(overlayIndex);
+        if (!children.IndexOf(fill, fillIndex)) {
+            return false;
+        }
+    } else {
+        DetachOverlay(target);  // it may still sit in a recycled template
+    }
+    CopyLayout(fill, target.overlay);
+    children.InsertAt(fillIndex + 1, target.overlay);
+    return true;
+}
+
+void HideNative(BackgroundTarget& target,
+                std::shared_ptr<BackgroundTarget> const& self,
+                shapes::Shape const& fill) {
+    target.hidingNative = true;
+    target.fillOpacity.Save(fill, wux::UIElement::OpacityProperty());
+    if (fill.Opacity() != 0.0) {
+        fill.Opacity(0.0);
+    }
+    if (auto stroke = FindStroke(target)) {
+        if (!target.strokeCallbackRegistered) {
+            std::weak_ptr<BackgroundTarget> weak = self;
+            stroke.RegisterPropertyChangedCallback(
+                wux::UIElement::OpacityProperty(),
+                [weak](wux::DependencyObject const& sender,
+                       wux::DependencyProperty const&) {
+                    try {
+                        KeepTransparent(sender, weak);
+                    } catch (...) {
+                    }
+                });
+            target.strokeCallbackRegistered = true;
+        }
+        target.strokeOpacity.Save(stroke, wux::UIElement::OpacityProperty());
+        if (stroke.Opacity() != 0.0) {
+            stroke.Opacity(0.0);
+        }
+    }
+}
+
+void RestoreTarget(BackgroundTarget& target) {
+    target.hidingNative = false;
+    target.mode = kSurfaceNative;
+    DetachOverlay(target);
+    if (auto fill = target.fill.get()) {
+        target.fillOpacity.Restore(fill, wux::UIElement::OpacityProperty());
+        target.directFill.Restore(fill, shapes::Shape::FillProperty());
+    }
+    if (auto stroke = target.stroke.get()) {
+        target.strokeOpacity.Restore(stroke, wux::UIElement::OpacityProperty());
+    }
+}
+
+void UpdateTarget(std::shared_ptr<BackgroundTarget> const& self, bool active) {
+    BackgroundTarget& target = *self;
+    auto fill = target.fill.get();
+    if (!fill) {
+        return;
+    }
+    const ULONGLONG now = GetTickCount64();
+    if (!target.taskbar || !IsWindow(target.taskbar) ||
+        now - target.resolvedAt > kTaskbarResolveMilliseconds) {
+        target.taskbar = ResolveTaskbarWindow(fill);
+        target.resolvedAt = now;
+    }
+
+    LONG mode = kSurfaceNative;
+    const SlotCache* slot = nullptr;
+    if (active && target.taskbar) {
+        slot = &SlotFor(target.taskbar);
+        mode = slot->EffectiveMode();
+    }
+    if (mode == kSurfaceNative) {
+        if (target.mode != kSurfaceNative || target.hidingNative) {
+            RestoreTarget(target);
+        }
+        return;
+    }
+
+    const media::Brush brush = mode == kSurfaceImage
+        ? BrushForSlot(target.taskbar, *slot)
+        : TransparentBrush();
+    g_applying = true;
+    if (EnsureOverlay(target, fill)) {
+        target.directFill.Restore(fill, shapes::Shape::FillProperty());
+        if (target.overlay.Fill() != brush) {
+            target.overlay.Fill(brush);
+        }
+        HideNative(target, self, fill);
+    } else {
+        // Fallback for an unexpected template: paint the native fill itself.
+        target.directFill.Save(fill, shapes::Shape::FillProperty());
+        if (fill.Fill() != brush) {
+            fill.Fill(brush);
+        }
+        target.hidingNative = false;
+        if (auto stroke = FindStroke(target)) {
+            target.strokeOpacity.Save(stroke, wux::UIElement::OpacityProperty());
+            if (stroke.Opacity() != 0.0) {
+                stroke.Opacity(0.0);
+            }
+        }
+    }
+    g_applying = false;
+    target.mode = mode;
+}
+
+void RegisterBackground(wux::FrameworkElement element) {
+    auto shape = element.try_as<shapes::Shape>();
+    if (!shape || element.Name() != L"BackgroundFill") {
+        return;
+    }
+    auto background = FindAncestorClass(
+        element, L"Taskbar.TaskbarBackground", L"HoverFlyoutBackgroundControl");
+    if (!background) {
+        return;
+    }
+    const bool known = std::any_of(
+        g_backgrounds.begin(), g_backgrounds.end(),
+        [&](const std::shared_ptr<BackgroundTarget>& item) {
+            return item->fill.get() == shape;
+        });
+    if (known) {
+        return;
+    }
+    auto target = std::make_shared<BackgroundTarget>();
+    target->fill = winrt::make_weak(shape);
+    target->background = winrt::make_weak(background);
+    std::weak_ptr<BackgroundTarget> weak = target;
+    shape.RegisterPropertyChangedCallback(
+        wux::UIElement::OpacityProperty(),
+        [weak](wux::DependencyObject const& sender, wux::DependencyProperty const&) {
+            try {
+                KeepTransparent(sender, weak);
+            } catch (...) {
+            }
+        });
+    g_backgrounds.push_back(std::move(target));
+}
+
+// ---------------------------------------------------------------------------
+// Adaptive contrast
+// ---------------------------------------------------------------------------
+
+thread_local ContrastSettings g_contrast;
 
 double LinearChannel(std::uint8_t channel) {
     const double srgb = static_cast<double>(channel) / 255.0;
@@ -489,149 +796,132 @@ double PixelLuminance(std::uint32_t bgra) {
            0.0722 * LinearChannel(blue);
 }
 
-std::optional<double> SampleTrayLuminance(TrayContext& context,
-                                          wux::FrameworkElement frame) {
-    if (!context.taskbar || !IsWindow(context.taskbar)) {
-        context.taskbar = ResolveTaskbarWindow(frame);
-    }
-    if (!context.taskbar) {
+// Median luminance of the published pixels directly beneath an element.
+std::optional<double> LuminanceBeneath(wux::FrameworkElement const& element,
+                                       const SlotCache& slot) {
+    if (!slot.HasPixels()) {
         return std::nullopt;
     }
-
-    RECT taskbarRect{};
-    if (!GetWindowRect(context.taskbar, &taskbarRect)) {
+    const auto root = element.XamlRoot();
+    if (!root) {
         return std::nullopt;
     }
-    const UINT dpi = WindowDpi(context.taskbar);
-    const double scale = static_cast<double>(dpi ? dpi : 96) / 96.0;
-    const auto topLeft = frame.TransformToVisual(nullptr).TransformPoint({0, 0});
-    const LONG frameLeft = taskbarRect.left +
-                           static_cast<LONG>(std::lround(topLeft.X * scale));
-    const LONG frameTop = taskbarRect.top +
-                          static_cast<LONG>(std::lround(topLeft.Y * scale));
-    const LONG frameRight = frameLeft + static_cast<LONG>(
-        std::lround(frame.ActualWidth() * scale));
-    const LONG frameBottom = frameTop + static_cast<LONG>(
-        std::lround(frame.ActualHeight() * scale));
-
-    // Sample the final composed pixels beneath the tray. This includes the
-    // user's brightness and blur settings, so contrast follows what is visible.
-    RECT sample{
-        std::clamp(frameLeft, taskbarRect.left, taskbarRect.right),
-        std::clamp(frameTop, taskbarRect.top, taskbarRect.bottom),
-        std::clamp(frameRight, taskbarRect.left, taskbarRect.right),
-        std::clamp(frameBottom, taskbarRect.top, taskbarRect.bottom)};
-    if (sample.right <= sample.left || sample.bottom <= sample.top) {
+    const double scale = root.RasterizationScale();
+    const auto topLeft = element.TransformToVisual(nullptr).TransformPoint({0, 0});
+    const bool horizontal = slot.pixelHeight == 1;
+    const double logicalStart = horizontal ? topLeft.X : topLeft.Y;
+    const double logicalLength =
+        horizontal ? element.ActualWidth() : element.ActualHeight();
+    const int available = horizontal ? slot.pixelWidth : slot.pixelHeight;
+    int start = static_cast<int>(std::floor(logicalStart * scale));
+    int end = static_cast<int>(
+        std::ceil((logicalStart + std::max(1.0, logicalLength)) * scale));
+    start = std::clamp(start, 0, available);
+    end = std::clamp(end, 0, available);
+    if (end <= start) {
         return std::nullopt;
     }
-
-    const int sourceWidth = sample.right - sample.left;
-    const int sourceHeight = sample.bottom - sample.top;
-    const bool horizontal = sourceWidth >= sourceHeight;
-    const int outputWidth = horizontal ? 48 : 4;
-    const int outputHeight = horizontal ? 4 : 48;
-
-    BITMAPINFO info{};
-    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    info.bmiHeader.biWidth = outputWidth;
-    info.bmiHeader.biHeight = -outputHeight;
-    info.bmiHeader.biPlanes = 1;
-    info.bmiHeader.biBitCount = 32;
-    info.bmiHeader.biCompression = BI_RGB;
-
-    HDC screen = GetDC(nullptr);
-    HDC memory = screen ? CreateCompatibleDC(screen) : nullptr;
-    void* bits = nullptr;
-    HBITMAP bitmap = screen
-        ? CreateDIBSection(screen, &info, DIB_RGB_COLORS, &bits, nullptr, 0)
-        : nullptr;
-    if (!screen || !memory || !bitmap || !bits) {
-        if (bitmap) DeleteObject(bitmap);
-        if (memory) DeleteDC(memory);
-        if (screen) ReleaseDC(nullptr, screen);
-        return std::nullopt;
+    std::vector<double> values;
+    values.reserve(static_cast<std::size_t>(end - start));
+    for (int pixel = start; pixel < end; ++pixel) {
+        values.push_back(PixelLuminance(slot.pixels[static_cast<std::size_t>(pixel)]));
     }
-
-    HGDIOBJ oldBitmap = SelectObject(memory, bitmap);
-    SetStretchBltMode(memory, COLORONCOLOR);
-    const BOOL copied = StretchBlt(
-        memory, 0, 0, outputWidth, outputHeight, screen,
-        sample.left, sample.top, sourceWidth, sourceHeight,
-        SRCCOPY | CAPTUREBLT);
-
-    std::optional<double> result;
-    if (copied) {
-        const auto* pixels = static_cast<const std::uint32_t*>(bits);
-        std::vector<double> values;
-        values.reserve(static_cast<std::size_t>(outputWidth * outputHeight));
-        for (int index = 0; index < outputWidth * outputHeight; ++index) {
-            values.push_back(PixelLuminance(pixels[index]));
-        }
-        auto middle = values.begin() + values.size() / 2;
-        std::nth_element(values.begin(), middle, values.end());
-        result = *middle;
-    }
-
-    SelectObject(memory, oldBitmap);
-    DeleteObject(bitmap);
-    DeleteDC(memory);
-    ReleaseDC(nullptr, screen);
-    return result;
+    auto middle = values.begin() + static_cast<std::ptrdiff_t>(values.size() / 2);
+    std::nth_element(values.begin(), middle, values.end());
+    return *middle;
 }
 
-void RefreshForegroundTargets(TrayContext& context,
-                              wux::FrameworkElement frame) {
-    VisitDescendants(frame, [&](wux::FrameworkElement element) {
-        if (auto text = element.try_as<controls::TextBlock>()) {
-            const bool known = std::any_of(
-                context.textTargets.begin(), context.textTargets.end(),
-                [&](const TextForegroundOverride& target) {
-                    return target.element.get() == text;
-                });
-            if (!known) {
-                context.textTargets.push_back(
-                    {winrt::make_weak(text), text.Foreground()});
-            }
+struct Hysteresis {
+    bool initialized = false;
+    bool light = false;
+    double filtered = 0.0;
+
+    // Returns true when the light/dark decision changed.
+    bool Update(double luminance) {
+        if (!initialized) {
+            filtered = luminance;
+            light = luminance < (g_contrast.lightThreshold + g_contrast.darkThreshold) / 2.0;
+            initialized = true;
+            return true;
         }
-        if (auto icon = element.try_as<controls::IconElement>()) {
-            const bool known = std::any_of(
-                context.iconTargets.begin(), context.iconTargets.end(),
-                [&](const IconForegroundOverride& target) {
-                    return target.element.get() == icon;
-                });
-            if (!known) {
-                context.iconTargets.push_back(
-                    {winrt::make_weak(icon), icon.Foreground()});
-            }
+        constexpr double kNewSampleMix = 0.38;
+        filtered = filtered * (1.0 - kNewSampleMix) + luminance * kNewSampleMix;
+        if (light && filtered > g_contrast.darkThreshold) {
+            light = false;
+            return true;
         }
-    });
+        if (!light && filtered < g_contrast.lightThreshold) {
+            light = true;
+            return true;
+        }
+        return false;
+    }
+};
+
+struct TextForegroundOverride {
+    winrt::weak_ref<controls::TextBlock> element;
+    SavedLocalValue original;
+};
+
+struct IconForegroundOverride {
+    winrt::weak_ref<controls::IconElement> element;
+    SavedLocalValue original;
+};
+
+struct TrayContext {
+    winrt::weak_ref<wux::FrameworkElement> frame;
+    winrt::weak_ref<wux::FrameworkElement> themeTarget;
+    HWND taskbar = nullptr;
+    ULONGLONG resolvedAt = 0;
+    ULONGLONG refreshedAt = 0;
+    SavedLocalValue frameTheme;
+    SavedLocalValue targetTheme;
+    Hysteresis decision;
+    bool applied = false;
+    std::vector<TextForegroundOverride> textTargets;
+    std::vector<IconForegroundOverride> iconTargets;
+};
+
+thread_local std::vector<std::shared_ptr<TrayContext>> g_trays;
+
+media::SolidColorBrush GlyphBrush(bool light) {
+    thread_local media::SolidColorBrush lightBrush{nullptr};
+    thread_local media::SolidColorBrush darkBrush{nullptr};
+    auto& brush = light ? lightBrush : darkBrush;
+    if (!brush) {
+        brush = media::SolidColorBrush(
+            light ? winrt::Windows::UI::Color{255, 255, 255, 255}
+                  : winrt::Windows::UI::Color{255, 18, 18, 18});
+    }
+    return brush;
 }
 
 void RestoreTray(TrayContext& context) {
-    if (!context.overridesApplied) {
-        return;
-    }
-    if (auto frame = context.frame.get()) {
-        frame.RequestedTheme(context.originalFrameTheme);
-    }
-    if (auto target = context.themeTarget.get()) {
-        target.RequestedTheme(context.originalTargetTheme);
-    }
-    for (auto& target : context.textTargets) {
-        if (auto element = target.element.get()) {
-            element.Foreground(target.original);
+    if (context.applied) {
+        if (auto frame = context.frame.get()) {
+            context.frameTheme.Restore(frame, wux::FrameworkElement::RequestedThemeProperty());
+        }
+        if (auto target = context.themeTarget.get()) {
+            context.targetTheme.Restore(target, wux::FrameworkElement::RequestedThemeProperty());
+        }
+        for (auto& target : context.textTargets) {
+            if (auto element = target.element.get()) {
+                target.original.Restore(element, controls::TextBlock::ForegroundProperty());
+            }
+        }
+        for (auto& target : context.iconTargets) {
+            if (auto element = target.element.get()) {
+                target.original.Restore(element, controls::IconElement::ForegroundProperty());
+            }
         }
     }
-    for (auto& target : context.iconTargets) {
-        if (auto element = target.element.get()) {
-            element.Foreground(target.original);
-        }
-    }
-    context.overridesApplied = false;
-    context.initialized = false;
+    context.textTargets.clear();
+    context.iconTargets.clear();
+    context.applied = false;
+    context.decision = {};
 }
 
-void ApplyTrayForeground(TrayContext& context, bool light) {
+void ApplyTrayForeground(TrayContext& context, bool refreshTargets) {
     auto frame = context.frame.get();
     if (!frame) {
         return;
@@ -643,324 +933,97 @@ void ApplyTrayForeground(TrayContext& context, bool light) {
             target = frame;
         }
         context.themeTarget = target;
-        context.originalTargetTheme = target.RequestedTheme();
+        context.targetTheme = {};
+    }
+    const bool light = context.decision.light;
+    const auto theme = light ? wux::ElementTheme::Dark : wux::ElementTheme::Light;
+    context.frameTheme.Save(frame, wux::FrameworkElement::RequestedThemeProperty());
+    context.targetTheme.Save(target, wux::FrameworkElement::RequestedThemeProperty());
+    if (frame.RequestedTheme() != theme) {
+        frame.RequestedTheme(theme);
+    }
+    if (target.RequestedTheme() != theme) {
+        target.RequestedTheme(theme);
     }
 
-    RefreshForegroundTargets(context, frame);
-    const auto theme = light ? wux::ElementTheme::Dark
-                             : wux::ElementTheme::Light;
-    frame.RequestedTheme(theme);
-    target.RequestedTheme(theme);
-    const auto color = light ? winrt::Windows::UI::Color{255, 255, 255, 255}
-                             : winrt::Windows::UI::Color{255, 18, 18, 18};
-    auto brush = media::SolidColorBrush(color);
-    for (auto& foreground : context.textTargets) {
-        if (auto element = foreground.element.get()) {
-            element.Foreground(brush);
+    if (refreshTargets) {
+        std::erase_if(context.textTargets, [](const TextForegroundOverride& item) {
+            return !item.element.get();
+        });
+        std::erase_if(context.iconTargets, [](const IconForegroundOverride& item) {
+            return !item.element.get();
+        });
+        VisitDescendants(frame, [&](wux::FrameworkElement element) {
+            if (auto text = element.try_as<controls::TextBlock>()) {
+                const bool known = std::any_of(
+                    context.textTargets.begin(), context.textTargets.end(),
+                    [&](const TextForegroundOverride& item) { return item.element.get() == text; });
+                if (!known) {
+                    context.textTargets.push_back({winrt::make_weak(text), {}});
+                }
+            } else if (auto icon = element.try_as<controls::IconElement>()) {
+                const bool known = std::any_of(
+                    context.iconTargets.begin(), context.iconTargets.end(),
+                    [&](const IconForegroundOverride& item) { return item.element.get() == icon; });
+                if (!known) {
+                    context.iconTargets.push_back({winrt::make_weak(icon), {}});
+                }
+            }
+        });
+    }
+
+    const auto brush = GlyphBrush(light);
+    for (auto& item : context.textTargets) {
+        if (auto element = item.element.get()) {
+            item.original.Save(element, controls::TextBlock::ForegroundProperty());
+            if (element.Foreground() != brush) {
+                element.Foreground(brush);
+            }
         }
     }
-    for (auto& foreground : context.iconTargets) {
-        if (auto element = foreground.element.get()) {
-            element.Foreground(brush);
+    for (auto& item : context.iconTargets) {
+        if (auto element = item.element.get()) {
+            item.original.Save(element, controls::IconElement::ForegroundProperty());
+            if (element.Foreground() != brush) {
+                element.Foreground(brush);
+            }
         }
     }
-    context.overridesApplied = true;
-    WriteTrayDiagnostic(context);
+    context.applied = true;
 }
 
-void UpdateTray(TrayContext& context, bool appActive) {
+void UpdateTray(TrayContext& context, bool active) {
     auto frame = context.frame.get();
     if (!frame) {
         return;
     }
-    if (!appActive || !g_contrastSettings.enabled) {
+    if (!active || !g_contrast.enabled) {
         RestoreTray(context);
         return;
     }
-
-    const auto luminance = SampleTrayLuminance(context, frame);
-    if (!luminance) {
-        return;
-    }
-    bool changed = false;
-    if (!context.initialized) {
-        context.filteredLuminance = *luminance;
-        context.lightGlyphs =
-            *luminance <
-            (g_contrastSettings.lightThreshold +
-             g_contrastSettings.darkThreshold) /
-                2.0;
-        context.initialized = true;
-        changed = true;
-    } else {
-        constexpr double kNewSampleMix = 0.38;
-        context.filteredLuminance =
-            context.filteredLuminance * (1.0 - kNewSampleMix) +
-            *luminance * kNewSampleMix;
-        if (context.lightGlyphs &&
-            context.filteredLuminance > g_contrastSettings.darkThreshold) {
-            context.lightGlyphs = false;
-            changed = true;
-        } else if (!context.lightGlyphs &&
-                   context.filteredLuminance <
-                       g_contrastSettings.lightThreshold) {
-            context.lightGlyphs = true;
-            changed = true;
-        }
-    }
-    if (changed || !context.overridesApplied) {
-        ApplyTrayForeground(context, context.lightGlyphs);
-    }
-}
-
-std::optional<double> SampleIndicatorLuminance(
-    RunningIndicatorOverride& context,
-    shapes::Shape indicator) {
-    if (!context.taskbar || !IsWindow(context.taskbar)) {
-        context.taskbar = ResolveTaskbarWindow(indicator);
+    const ULONGLONG now = GetTickCount64();
+    if (!context.taskbar || !IsWindow(context.taskbar) ||
+        now - context.resolvedAt > kTaskbarResolveMilliseconds) {
+        context.taskbar = ResolveTaskbarWindow(frame);
+        context.resolvedAt = now;
     }
     if (!context.taskbar) {
-        return std::nullopt;
-    }
-    const auto snapshot = ReadSurface(context.taskbar);
-    if (!snapshot || !snapshot->visible || snapshot->pixels.empty()) {
-        return std::nullopt;
-    }
-
-    const auto root = indicator.XamlRoot();
-    const double scale = root
-        ? static_cast<double>(root.RasterizationScale())
-        : static_cast<double>(WindowDpi(context.taskbar)) / 96.0;
-    const auto topLeft =
-        indicator.TransformToVisual(nullptr).TransformPoint({0, 0});
-    const bool horizontal = snapshot->pixelHeight == 1;
-    const double logicalStart = horizontal ? topLeft.X : topLeft.Y;
-    const double logicalLength = horizontal
-        ? indicator.ActualWidth()
-        : indicator.ActualHeight();
-    const int available = horizontal
-        ? snapshot->pixelWidth
-        : snapshot->pixelHeight;
-    int start = static_cast<int>(std::floor(logicalStart * scale));
-    int end = static_cast<int>(std::ceil(
-        (logicalStart + std::max(1.0, logicalLength)) * scale));
-    start = std::clamp(start, 0, available);
-    end = std::clamp(end, 0, available);
-    if (end <= start) {
-        return std::nullopt;
-    }
-
-    std::vector<double> luminances;
-    luminances.reserve(static_cast<std::size_t>(end - start));
-    for (int pixel = start; pixel < end; ++pixel) {
-        luminances.push_back(PixelLuminance(
-            snapshot->pixels[static_cast<std::size_t>(pixel)]));
-    }
-    auto middle = luminances.begin() + luminances.size() / 2;
-    std::nth_element(luminances.begin(), middle, luminances.end());
-    return *middle;
-}
-
-void RestoreRunningIndicator(RunningIndicatorOverride& context) {
-    if (!context.overridden) {
         return;
     }
-    if (auto indicator = context.element.get()) {
-        indicator.Fill(context.original);
-    }
-    context.applied = nullptr;
-    context.overridden = false;
-    context.initialized = false;
-}
-
-void UpdateRunningIndicator(
-    RunningIndicatorOverride& context,
-    bool appActive) {
-    auto indicator = context.element.get();
-    if (!indicator) {
+    const SlotCache& slot = SlotFor(context.taskbar);
+    if (slot.EffectiveMode() == kSurfaceNative) {
+        RestoreTray(context);
         return;
     }
-    if (!appActive || !g_contrastSettings.enabled) {
-        RestoreRunningIndicator(context);
-        return;
-    }
-    const auto luminance = SampleIndicatorLuminance(context, indicator);
+    const auto luminance = LuminanceBeneath(frame, slot);
     if (!luminance) {
-        RestoreRunningIndicator(context);
         return;
     }
-
-    bool changed = false;
-    if (!context.initialized) {
-        context.filteredLuminance = *luminance;
-        context.light =
-            *luminance <
-            (g_contrastSettings.lightThreshold +
-             g_contrastSettings.darkThreshold) /
-                2.0;
-        context.initialized = true;
-        changed = true;
-    } else {
-        constexpr double kNewSampleMix = 0.38;
-        context.filteredLuminance =
-            context.filteredLuminance * (1.0 - kNewSampleMix) +
-            *luminance * kNewSampleMix;
-        if (context.light &&
-            context.filteredLuminance > g_contrastSettings.darkThreshold) {
-            context.light = false;
-            changed = true;
-        } else if (!context.light &&
-                   context.filteredLuminance <
-                       g_contrastSettings.lightThreshold) {
-            context.light = true;
-            changed = true;
-        }
-    }
-
-    if (changed || !context.applied) {
-        const auto color = context.light
-            ? winrt::Windows::UI::Color{255, 255, 255, 255}
-            : winrt::Windows::UI::Color{255, 18, 18, 18};
-        context.applied = media::SolidColorBrush(color);
-    }
-    const auto current = indicator.Fill();
-    if (winrt::get_abi(current) != winrt::get_abi(context.applied)) {
-        indicator.Fill(context.applied);
-    }
-    context.overridden = true;
-}
-
-void UpdateBackgrounds(bool active) {
-    if (!g_transparentBrush) {
-        g_transparentBrush = media::SolidColorBrush(
-            winrt::Windows::UI::Color{0, 0, 0, 0});
-    }
-    std::erase_if(g_backgrounds, [](const BackgroundOverride& item) {
-        return !item.element.get();
-    });
-    for (auto& item : g_backgrounds) {
-        if (auto shape = item.element.get()) {
-            if (active) {
-                const auto snapshot = ReadSurface(item.taskbar);
-                const media::Brush desired = snapshot
-                    ? BrushForSurface(item.taskbar, *snapshot)
-                    : media::Brush{g_transparentBrush};
-                const auto current = shape.Fill();
-                if (winrt::get_abi(current) != winrt::get_abi(desired)) {
-                    if (item.overridden) {
-                        RecordBackgroundGuardCorrection();
-                    }
-                    g_applyingBackground = true;
-                    shape.Fill(desired);
-                    g_applyingBackground = false;
-                }
-                item.overridden = true;
-                if (snapshot && snapshot->visible &&
-                    !g_surfaceDiagnosticWritten) {
-                    const std::wstring path = LocalSettingsPath();
-                    if (!path.empty()) {
-                        WritePrivateProfileStringW(
-                            L"diagnostics",
-                            L"surface_bridge",
-                            L"native XAML image active",
-                            path.c_str());
-                    }
-                    g_surfaceDiagnosticWritten = true;
-                }
-            } else if (item.overridden) {
-                g_applyingBackground = true;
-                shape.Fill(item.original);
-                g_applyingBackground = false;
-                item.overridden = false;
-            }
-        }
-    }
-}
-
-void FlushPendingDiagnosticsReferences();
-
-void Pulse() {
-    try {
-        const ULONGLONG now = GetTickCount64();
-        if (now - g_lastSettingsRead >= 750) {
-            g_contrastSettings = ReadContrastSettings();
-            g_lastSettingsRead = now;
-        }
-        const bool active = IsChameleonBarActive();
-        UpdateBackgrounds(active);
-        std::erase_if(g_trays, [](const std::shared_ptr<TrayContext>& tray) {
-            return !tray->frame.get();
-        });
-        for (const auto& tray : g_trays) {
-            UpdateTray(*tray, active);
-        }
-        std::erase_if(
-            g_runningIndicators,
-            [](const RunningIndicatorOverride& indicator) {
-                return !indicator.element.get();
-            });
-        for (auto& indicator : g_runningIndicators) {
-            UpdateRunningIndicator(indicator, active);
-        }
-    } catch (...) {
-        DebugLog(L"pulse failed");
-    }
-}
-
-void EnsurePulseTimer() {
-    if (g_pulseTimer) {
-        return;
-    }
-    g_pulseTimer = wux::DispatcherTimer();
-    g_pulseTimer.Interval(wf::TimeSpan{std::chrono::milliseconds(33)});
-    g_pulseToken = g_pulseTimer.Tick(
-        [](wf::IInspectable const&, wf::IInspectable const&) {
-            Pulse();
-            FlushPendingDiagnosticsReferences();
-        });
-    g_pulseTimer.Start();
-}
-
-void RegisterBackground(wux::FrameworkElement element) {
-    auto shape = element.try_as<shapes::Shape>();
-    if (!shape) {
-        return;
-    }
-    const std::wstring name = element.Name().c_str();
-    if (name != L"BackgroundFill" && name != L"BackgroundStroke") {
-        return;
-    }
-    if (!HasAncestorClass(
-            element,
-            L"Taskbar.TaskbarBackground",
-            L"HoverFlyoutBackgroundControl")) {
-        return;
-    }
-    const bool known = std::any_of(
-        g_backgrounds.begin(), g_backgrounds.end(),
-        [&](const BackgroundOverride& item) {
-            return item.element.get() == shape;
-        });
-    if (!known) {
-        g_backgrounds.push_back({
-            winrt::make_weak(shape),
-            shape.Fill(),
-            ResolveTaskbarWindow(element),
-            false});
-        shape.RegisterPropertyChangedCallback(
-            shapes::Shape::FillProperty(),
-            [](wux::DependencyObject const&,
-               wux::DependencyProperty const&) {
-                try {
-                    if (!IsChameleonBarActive() || g_applyingBackground) {
-                        return;
-                    }
-                    RecordBackgroundGuardCorrection();
-                    UpdateBackgrounds(true);
-                } catch (...) {
-                    DebugLog(L"background visual-state guard failed");
-                }
-            });
+    const bool changed = context.decision.Update(*luminance);
+    const bool refresh = now - context.refreshedAt > kTrayRefreshMilliseconds;
+    if (changed || !context.applied || refresh) {
+        ApplyTrayForeground(context, changed || !context.applied || refresh);
+        context.refreshedAt = now;
     }
 }
 
@@ -973,14 +1036,68 @@ void RegisterTray(wux::FrameworkElement element) {
         [&](const std::shared_ptr<TrayContext>& context) {
             return context->frame.get() == element;
         });
-    if (known) {
+    if (!known) {
+        auto context = std::make_shared<TrayContext>();
+        context->frame = element;
+        g_trays.push_back(std::move(context));
+    }
+}
+
+struct RunningIndicatorOverride {
+    winrt::weak_ref<shapes::Shape> element;
+    SavedLocalValue original;
+    HWND taskbar = nullptr;
+    ULONGLONG resolvedAt = 0;
+    Hysteresis decision;
+    bool overridden = false;
+};
+
+thread_local std::vector<RunningIndicatorOverride> g_runningIndicators;
+
+void RestoreRunningIndicator(RunningIndicatorOverride& context) {
+    if (context.overridden) {
+        if (auto indicator = context.element.get()) {
+            context.original.Restore(indicator, shapes::Shape::FillProperty());
+        }
+    }
+    context.overridden = false;
+    context.decision = {};
+}
+
+void UpdateRunningIndicator(RunningIndicatorOverride& context, bool active) {
+    auto indicator = context.element.get();
+    if (!indicator) {
         return;
     }
-    auto context = std::make_shared<TrayContext>();
-    context->frame = element;
-    context->originalFrameTheme = element.RequestedTheme();
-    context->taskbar = ResolveTaskbarWindow(element);
-    g_trays.push_back(std::move(context));
+    if (!active || !g_contrast.enabled) {
+        RestoreRunningIndicator(context);
+        return;
+    }
+    const ULONGLONG now = GetTickCount64();
+    if (!context.taskbar || !IsWindow(context.taskbar) ||
+        now - context.resolvedAt > kTaskbarResolveMilliseconds) {
+        context.taskbar = ResolveTaskbarWindow(indicator);
+        context.resolvedAt = now;
+    }
+    if (!context.taskbar) {
+        RestoreRunningIndicator(context);
+        return;
+    }
+    const SlotCache& slot = SlotFor(context.taskbar);
+    const auto luminance = slot.EffectiveMode() == kSurfaceNative
+        ? std::nullopt
+        : LuminanceBeneath(indicator, slot);
+    if (!luminance) {
+        RestoreRunningIndicator(context);
+        return;
+    }
+    context.decision.Update(*luminance);
+    const auto brush = GlyphBrush(context.decision.light);
+    context.original.Save(indicator, shapes::Shape::FillProperty());
+    if (indicator.Fill() != brush) {
+        indicator.Fill(brush);
+    }
+    context.overridden = true;
 }
 
 void RegisterRunningIndicator(wux::FrameworkElement element) {
@@ -991,45 +1108,142 @@ void RegisterRunningIndicator(wux::FrameworkElement element) {
     if (!indicator ||
         (!HasAncestorClass(element, L"Taskbar.TaskListButton") &&
          !HasAncestorClass(element, L"Taskbar.TaskListButtonPanel") &&
-         !HasAncestorClass(
-             element, L"Taskbar.TaskListLabeledButtonPanel"))) {
+         !HasAncestorClass(element, L"Taskbar.TaskListLabeledButtonPanel"))) {
         return;
     }
     const bool known = std::any_of(
-        g_runningIndicators.begin(),
-        g_runningIndicators.end(),
+        g_runningIndicators.begin(), g_runningIndicators.end(),
         [&](const RunningIndicatorOverride& context) {
             return context.element.get() == indicator;
         });
-    if (known) {
+    if (!known) {
+        RunningIndicatorOverride context;
+        context.element = winrt::make_weak(indicator);
+        g_runningIndicators.push_back(std::move(context));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pulse
+// ---------------------------------------------------------------------------
+
+thread_local wux::DispatcherTimer g_pulseTimer{nullptr};
+thread_local bool g_inPulse;
+thread_local bool g_wasActive;
+
+void FlushPendingDiagnosticsReferences();
+
+void Pulse() {
+    if (g_inPulse) {
         return;
     }
-    g_runningIndicators.push_back({
-        winrt::make_weak(indicator),
-        indicator.Fill(),
-        nullptr,
-        ResolveTaskbarWindow(element)});
-
-    const std::wstring path = LocalSettingsPath();
-    if (!path.empty()) {
-        const std::wstring count =
-            std::to_wstring(g_runningIndicators.size());
-        WritePrivateProfileStringW(
-            L"diagnostics", L"running_indicator_targets",
-            count.c_str(), path.c_str());
+    g_inPulse = true;
+    ++g_pulseNumber;
+    std::erase_if(g_slotCache, [](const SlotCache& cache) {
+        return !IsWindow(cache.taskbar);
+    });
+    std::erase_if(g_surfaceBrushes, [](const SurfaceBrushState& state) {
+        return !IsWindow(state.taskbar);
+    });
+    const bool active = IsChameleonBarActive();
+    if (active) {
+        g_contrast = ReadContrastSettings();
     }
+
+    int surfaces = 0;
+    std::erase_if(g_backgrounds, [](const std::shared_ptr<BackgroundTarget>& item) {
+        return !item->fill.get();
+    });
+    for (const auto& target : g_backgrounds) {
+        try {
+            UpdateTarget(target, active);
+            if (target->mode != kSurfaceNative) {
+                ++surfaces;
+            }
+        } catch (...) {
+            g_applying = false;
+            DebugLog(L"background update failed");
+        }
+    }
+
+    int trays = 0;
+    std::erase_if(g_trays, [](const std::shared_ptr<TrayContext>& tray) {
+        return !tray->frame.get();
+    });
+    for (const auto& tray : g_trays) {
+        try {
+            UpdateTray(*tray, active);
+            trays += tray->applied ? 1 : 0;
+        } catch (...) {
+            DebugLog(L"tray update failed");
+        }
+    }
+
+    int indicators = 0;
+    std::erase_if(g_runningIndicators, [](const RunningIndicatorOverride& item) {
+        return !item.element.get();
+    });
+    for (auto& indicator : g_runningIndicators) {
+        try {
+            UpdateRunningIndicator(indicator, active);
+            indicators += indicator.overridden ? 1 : 0;
+        } catch (...) {
+            DebugLog(L"indicator update failed");
+        }
+    }
+
+    if (active && g_surfaceState && g_surfaceWritable) {
+        g_surfaceState->bridgeSurfaces = surfaces;
+        g_surfaceState->bridgeTrays = trays;
+        g_surfaceState->bridgeIndicators = static_cast<LONG>(indicators);
+        MemoryBarrier();
+        g_surfaceState->bridgeHeartbeat = static_cast<LONG>(GetTickCount() | 1u);
+    }
+
+    if (g_pulseTimer && active != g_wasActive) {
+        g_pulseTimer.Interval(active ? wf::TimeSpan{kActiveInterval}
+                                     : wf::TimeSpan{kIdleInterval});
+    }
+    g_wasActive = active;
+    g_inPulse = false;
+}
+
+void EnsurePulseTimer() {
+    if (g_pulseTimer) {
+        return;
+    }
+    g_pulseTimer = wux::DispatcherTimer();
+    g_pulseTimer.Interval(wf::TimeSpan{kActiveInterval});
+    g_wasActive = true;
+    g_pulseTimer.Tick([](wf::IInspectable const&, wf::IInspectable const&) {
+        try {
+            Pulse();
+        } catch (...) {
+            g_inPulse = false;
+            DebugLog(L"pulse failed");
+        }
+        FlushPendingDiagnosticsReferences();
+    });
+    g_pulseTimer.Start();
 }
 
 void HandleElement(wux::FrameworkElement element) {
+    if (element.Name() == kOverlayName) {
+        return;
+    }
     RegisterBackground(element);
     RegisterTray(element);
     RegisterRunningIndicator(element);
-    if (!g_backgrounds.empty() || !g_trays.empty() ||
-        !g_runningIndicators.empty()) {
+    if (!g_backgrounds.empty() || !g_trays.empty() || !g_runningIndicators.empty()) {
+        // Never modify the tree from inside the diagnostics callback: the
+        // timer applies everything on the next tick (at most 16 ms later).
         EnsurePulseTimer();
-        Pulse();
     }
 }
+
+// ---------------------------------------------------------------------------
+// XAML diagnostics attachment
+// ---------------------------------------------------------------------------
 
 // XamlDiagnostics implements this private test interface. Releasing its runtime
 // object reference prevents the diagnostics layer from pinning the entire taskbar
@@ -1101,10 +1315,11 @@ private:
                 wf::IInspectable inspectable;
                 winrt::check_hresult(diagnostics_->GetIInspectableFromHandle(
                     element.Handle,
-                    reinterpret_cast<::IInspectable**>(
-                        winrt::put_abi(inspectable))));
-                if (auto frameworkElement =
-                        inspectable.try_as<wux::FrameworkElement>()) {
+                    reinterpret_cast<::IInspectable**>(winrt::put_abi(inspectable))));
+                if (auto source = inspectable.try_as<hosting::DesktopWindowXamlSource>()) {
+                    RegisterXamlSource(source);
+                } else if (auto frameworkElement =
+                               inspectable.try_as<wux::FrameworkElement>()) {
                     HandleElement(frameworkElement);
                 }
             }
@@ -1163,12 +1378,10 @@ public:
             site_.copy_from(site);
             if (site_) {
                 // Keep the diagnostics load reference for Explorer's lifetime.
-                // Unlike a Windhawk mod, this standalone bridge has no second
-                // host-owned module reference to fall back to.
                 g_watcher = winrt::make_self<VisualTreeWatcher>(site_);
                 if (!g_readyEvent) {
                     g_readyEvent = CreateEventW(
-                        nullptr, TRUE, TRUE, kBridgeReadyEventName);
+                        nullptr, TRUE, TRUE, chameleon::kBridgeReadyEventName);
                 } else {
                     SetEvent(g_readyEvent);
                 }
@@ -1246,7 +1459,7 @@ STDAPI DllGetClassObject(
     REFIID interfaceId,
     LPVOID* result) {
     try {
-        if (classId != kChameleonBarTap) {
+        if (classId != chameleon::kChameleonBarTapClsid) {
             return CLASS_E_CLASSNOTAVAILABLE;
         }
         *result = nullptr;

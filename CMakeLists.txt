@@ -12,6 +12,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_executable(ChameleonBar WIN32
     app.rc
     src/main.cpp
+    src/ui.cpp
     src/color_sampler.cpp
     src/settings.cpp
     src/surface_publisher.cpp
@@ -21,7 +22,7 @@ add_executable(ChameleonBar WIN32
 target_include_directories(ChameleonBar PRIVATE src)
 target_compile_definitions(ChameleonBar PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(ChameleonBar PRIVATE
-    user32 gdi32 shell32 dwmapi advapi32 ole32 uuid comctl32 uxtheme
+    user32 gdi32 gdiplus shell32 dwmapi advapi32 ole32 uuid
 )
 
 add_library(ChameleonBarXamlBridge SHARED
@@ -42,10 +43,11 @@ add_executable(sampler_tests
     src/color_sampler.cpp
     src/surface_publisher.cpp
     src/window_activity.cpp
+    src/settings.cpp
 )
 target_include_directories(sampler_tests PRIVATE src)
 target_compile_definitions(sampler_tests PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_link_libraries(sampler_tests PRIVATE user32 dwmapi)
+target_link_libraries(sampler_tests PRIVATE user32 dwmapi shell32 advapi32)
 
 enable_testing()
 add_test(NAME sampler_tests COMMAND sampler_tests)

@@ -1,9 +1,6 @@
-#define WIN32_LEAN_AND_MEAN
-
 #include "xaml_bridge_client.h"
 
 #include <windows.h>
-#include <xamlom.h>
 
 #include <array>
 #include <string>
@@ -11,14 +8,14 @@
 namespace chameleon {
 namespace {
 
-// {7B5E11EE-9EC1-4BA2-AD74-2872EAF766FB}
-constexpr CLSID kChameleonBarTap = {
-    0x7b5e11ee,
-    0x9ec1,
-    0x4ba2,
-    {0xad, 0x74, 0x28, 0x72, 0xea, 0xf7, 0x66, 0xfb}};
-
-using InitializeXamlDiagnosticsExFunction = decltype(&InitializeXamlDiagnosticsEx);
+// Declared here so the app does not depend on xamlom.h being present.
+using InitializeXamlDiagnosticsExFunction = HRESULT(WINAPI*)(
+    LPCWSTR endPointName,
+    DWORD pid,
+    LPCWSTR xamlDiagnosticsDll,
+    LPCWSTR tapDll,
+    CLSID tapClsid,
+    LPCWSTR initializationData);
 
 DWORD ExplorerTaskbarProcessId() {
     HWND taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
@@ -48,10 +45,26 @@ std::wstring StatusText(HRESULT status) {
     }
     while (!result.empty() &&
            (result.back() == L'\r' || result.back() == L'\n' ||
-            result.back() == L' ')) {
+            result.back() == L' ' || result.back() == L'.')) {
         result.pop_back();
     }
     return result;
+}
+
+bool IsBridgeReady() {
+    HANDLE readyEvent = OpenEventW(SYNCHRONIZE, FALSE, kBridgeReadyEventName);
+    if (!readyEvent) {
+        return false;
+    }
+    const bool ready = WaitForSingleObject(readyEvent, 0) == WAIT_OBJECT_0;
+    CloseHandle(readyEvent);
+    return ready;
+}
+
+std::wstring WindowsDirectoryPath() {
+    wchar_t buffer[MAX_PATH]{};
+    const UINT length = GetWindowsDirectoryW(buffer, MAX_PATH);
+    return length && length < MAX_PATH ? std::wstring(buffer, length) : L"C:\\Windows";
 }
 
 }  // namespace
@@ -75,33 +88,27 @@ std::wstring LocalBridgePath() {
 
 BridgeAttachResult AttachLocalXamlBridge() {
     BridgeAttachResult result;
-    HANDLE readyEvent =
-        OpenEventW(SYNCHRONIZE, FALSE, kBridgeReadyEventName);
-    if (readyEvent) {
-        const bool ready =
-            WaitForSingleObject(readyEvent, 0) == WAIT_OBJECT_0;
-        CloseHandle(readyEvent);
-        if (ready) {
-            result.status = S_OK;
-            result.attached = true;
-            result.message =
-                L"Local XAML bridge already active — Windhawk is not required";
-            return result;
-        }
+    if (IsBridgeReady()) {
+        result.status = S_OK;
+        result.attached = true;
+        result.message = L"Bridge already loaded in Explorer";
+        return result;
     }
 
     const std::wstring bridgePath = LocalBridgePath();
     if (bridgePath.empty() ||
         GetFileAttributesW(bridgePath.c_str()) == INVALID_FILE_ATTRIBUTES) {
         result.status = HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
-        result.message = L"Local tray bridge DLL is missing";
+        result.message =
+            L"ChameleonBar.XamlBridge.dll is missing. Keep it next to ChameleonBar.exe";
         return result;
     }
 
     const DWORD explorerProcessId = ExplorerTaskbarProcessId();
     if (!explorerProcessId) {
         result.status = HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
-        result.message = L"Windows taskbar process was not found";
+        result.retryable = true;
+        result.message = L"Waiting for the Windows taskbar to start";
         return result;
     }
 
@@ -109,15 +116,15 @@ BridgeAttachResult AttachLocalXamlBridge() {
         L"Windows.UI.Xaml.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!xaml) {
         result.status = HRESULT_FROM_WIN32(GetLastError());
-        result.message = L"Windows XAML runtime is unavailable";
+        result.message = L"The Windows XAML runtime is unavailable";
         return result;
     }
     const auto initialize =
         reinterpret_cast<InitializeXamlDiagnosticsExFunction>(
-            GetProcAddress(xaml, "InitializeXamlDiagnosticsEx"));
+            reinterpret_cast<void*>(GetProcAddress(xaml, "InitializeXamlDiagnosticsEx")));
     if (!initialize) {
         result.status = HRESULT_FROM_WIN32(GetLastError());
-        result.message = L"This Windows build does not expose the XAML diagnostics bridge";
+        result.message = L"This Windows build does not support the taskbar bridge";
         FreeLibrary(xaml);
         return result;
     }
@@ -131,7 +138,7 @@ BridgeAttachResult AttachLocalXamlBridge() {
             explorerProcessId,
             L"",
             bridgePath.c_str(),
-            kChameleonBarTap,
+            kChameleonBarTapClsid,
             nullptr);
         if (status != HRESULT_FROM_WIN32(ERROR_NOT_FOUND)) {
             break;
@@ -141,10 +148,59 @@ BridgeAttachResult AttachLocalXamlBridge() {
 
     result.status = status;
     result.attached = SUCCEEDED(status);
-    result.message = result.attached
-        ? L"Local XAML bridge active — Windhawk is not required"
-        : L"Local XAML bridge unavailable: " + StatusText(status);
+    if (result.attached) {
+        result.message = L"Bridge loaded into Explorer";
+    } else if (status == CLASS_E_CLASSNOTAVAILABLE) {
+        result.message =
+            L"An older ChameleonBar bridge is still loaded. Restart Explorer once";
+    } else {
+        result.retryable = true;
+        result.message = L"Bridge could not attach: " + StatusText(status);
+    }
     return result;
+}
+
+bool RestartExplorer() {
+    HWND taskbar = FindWindowW(L"Shell_TrayWnd", nullptr);
+    if (taskbar) {
+        DWORD processId = 0;
+        GetWindowThreadProcessId(taskbar, &processId);
+        HANDLE process = OpenProcess(
+            SYNCHRONIZE | PROCESS_TERMINATE, FALSE, processId);
+        // 0x5B4 is the message behind "Exit Explorer" on the taskbar context
+        // menu: a clean shutdown that saves state and does not auto-restart.
+        PostMessageW(taskbar, WM_USER + 436, 0, 0);
+        if (process) {
+            if (WaitForSingleObject(process, 8000) != WAIT_OBJECT_0) {
+                TerminateProcess(process, 1);
+                WaitForSingleObject(process, 3000);
+            }
+            CloseHandle(process);
+        } else {
+            Sleep(3000);
+        }
+        // Windows may restart a terminated shell by itself.
+        for (int attempt = 0; attempt < 10; ++attempt) {
+            if (FindWindowW(L"Shell_TrayWnd", nullptr)) {
+                return true;
+            }
+            Sleep(200);
+        }
+    }
+
+    const std::wstring explorer = WindowsDirectoryPath() + L"\\explorer.exe";
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION information{};
+    std::wstring commandLine = L"\"" + explorer + L"\"";
+    if (!CreateProcessW(
+            explorer.c_str(), commandLine.data(), nullptr, nullptr, FALSE, 0,
+            nullptr, nullptr, &startup, &information)) {
+        return false;
+    }
+    CloseHandle(information.hThread);
+    CloseHandle(information.hProcess);
+    return true;
 }
 
 }  // namespace chameleon

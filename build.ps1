@@ -44,8 +44,9 @@ if ($LASTEXITCODE -ne 0) { throw 'Local XAML bridge build failed.' }
     (Join-Path $Root 'src\color_sampler.cpp') `
     (Join-Path $Root 'src\surface_publisher.cpp') `
     (Join-Path $Root 'src\window_activity.cpp') `
+    (Join-Path $Root 'src\settings.cpp') `
     -static -static-libgcc -static-libstdc++ `
-    -luser32 -ldwmapi `
+    -luser32 -ldwmapi -lshell32 -ladvapi32 `
     -o (Join-Path $Build 'sampler_tests.exe')
 if ($LASTEXITCODE -ne 0) { throw 'Sampler test build failed.' }
 
@@ -56,6 +57,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Sampler tests failed.' }
     -municode -mwindows `
     -I (Join-Path $Root 'src') `
     (Join-Path $Root 'src\main.cpp') `
+    (Join-Path $Root 'src\ui.cpp') `
     (Join-Path $Root 'src\color_sampler.cpp') `
     (Join-Path $Root 'src\settings.cpp') `
     (Join-Path $Root 'src\surface_publisher.cpp') `
@@ -63,7 +65,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Sampler tests failed.' }
     (Join-Path $Root 'src\xaml_bridge_client.cpp') `
     $IconResource `
     -static -static-libgcc -static-libstdc++ `
-    -luser32 -lgdi32 -lshell32 -ldwmapi -ladvapi32 -lole32 -luuid -lcomctl32 -luxtheme `
+    -luser32 -lgdi32 -lgdiplus -lshell32 -ldwmapi -ladvapi32 -lole32 -luuid `
     -o (Join-Path $Build 'ChameleonBar.exe')
 if ($LASTEXITCODE -ne 0) { throw 'Application build failed.' }
 

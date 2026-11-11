@@ -99,8 +99,22 @@ bool IsExcludedShellProcess(const std::wstring& processName) {
 
 struct EnumerationContext {
     WindowActivity activity;
-    std::unordered_map<DWORD, std::wstring> processNames;
+    std::unordered_map<DWORD, std::wstring>* processNames = nullptr;
 };
+
+// Process names are looked up for every visible window on every scan, so keep
+// them between scans. The cache is flushed periodically so a reused process
+// id cannot keep a stale name for long.
+std::unordered_map<DWORD, std::wstring>& ProcessNameCache() {
+    static std::unordered_map<DWORD, std::wstring> cache;
+    static ULONGLONG flushedAt = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now - flushedAt > 5000) {
+        cache.clear();
+        flushedAt = now;
+    }
+    return cache;
+}
 
 BOOL CALLBACK CollectApplicationWindow(HWND window, LPARAM parameter) {
     auto& context = *reinterpret_cast<EnumerationContext*>(parameter);
@@ -111,7 +125,7 @@ BOOL CALLBACK CollectApplicationWindow(HWND window, LPARAM parameter) {
     snapshot.style = GetWindowLongPtrW(window, GWL_STYLE);
     snapshot.extendedStyle = GetWindowLongPtrW(window, GWL_EXSTYLE);
     snapshot.className = WindowClass(window);
-    snapshot.processName = ProcessName(window, context.processNames);
+    snapshot.processName = ProcessName(window, *context.processNames);
 
     DWORD cloaked = 0;
     if (SUCCEEDED(DwmGetWindowAttribute(
@@ -195,6 +209,7 @@ bool IsTaskbarTransientWindow(const WindowActivitySnapshot& window) {
         window.className == L"Shell_SecondaryTrayWnd" ||
         window.className == L"ChameleonBar.Backdrop" ||
         window.className == L"ChameleonBar.Controller" ||
+        window.className == L"ChameleonBar.Settings" ||
         window.className.starts_with(L"ShellHandwritingCanvas")) {
         return false;
     }
@@ -238,6 +253,7 @@ std::vector<RECT> EnumerateVisibleApplicationWindows() {
 
 WindowActivity EnumerateWindowActivity() {
     EnumerationContext context;
+    context.processNames = &ProcessNameCache();
     EnumWindows(
         CollectApplicationWindow, reinterpret_cast<LPARAM>(&context));
     return std::move(context.activity);
