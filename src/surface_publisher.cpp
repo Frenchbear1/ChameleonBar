@@ -237,13 +237,26 @@ BridgeHealth SurfacePublisher::Health() const {
     }
     const LONG heartbeat = state_->bridgeHeartbeat;
     const DWORD age = GetTickCount() - static_cast<DWORD>(heartbeat);
-    health.alive = heartbeat != 0 && age < 2500;
+    health.heartbeatAge = heartbeat != 0 ? age : 0;
+    health.alive = heartbeat != 0 && age < kAliveMilliseconds;
+    health.outdated = health.alive && state_->bridgeBuild != kBridgeBuild;
     if (health.alive) {
         health.surfaces = state_->bridgeSurfaces;
         health.trays = state_->bridgeTrays;
         health.indicators = state_->bridgeIndicators;
     }
     return health;
+}
+
+BridgeTiming SurfacePublisher::TakeTiming() {
+    BridgeTiming timing;
+    if (!state_) {
+        return timing;
+    }
+    timing.maxGapMs = InterlockedExchange(&state_->bridgeMaxGapMs, 0);
+    timing.slowestPulseMs = InterlockedExchange(&state_->bridgeSlowestPulseMs, 0);
+    timing.pulses = state_->bridgePulses;
+    return timing;
 }
 
 }  // namespace chameleon

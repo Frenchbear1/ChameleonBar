@@ -1084,6 +1084,7 @@ struct RunningIndicatorOverride {
     HWND taskbar = nullptr;
     ULONGLONG resolvedAt = 0;
     Hysteresis decision;
+    ULONGLONG appliedAt = 0;
     bool overridden = false;
 };
 
@@ -1126,11 +1127,16 @@ void UpdateRunningIndicator(RunningIndicatorOverride& context, bool active) {
         RestoreRunningIndicator(context);
         return;
     }
-    context.decision.Update(*luminance);
+    const bool changed = context.decision.Update(*luminance);
     const auto brush = GlyphBrush(context.decision.light);
     context.original.Save(indicator, shapes::Shape::FillProperty());
-    if (indicator.Fill() != brush) {
+    // Windows restyles underlines when an app gains or loses focus. Re-apply
+    // after that at most once a second instead of fighting it every frame,
+    // which kept Explorer's taskbar thread busy.
+    if (changed || !context.overridden ||
+        (now - context.appliedAt > 1000 && indicator.Fill() != brush)) {
         indicator.Fill(brush);
+        context.appliedAt = now;
     }
     context.overridden = true;
 }
@@ -1164,6 +1170,7 @@ void RegisterRunningIndicator(wux::FrameworkElement element) {
 
 thread_local wux::DispatcherTimer g_pulseTimer{nullptr};
 thread_local bool g_inPulse;
+thread_local ULONGLONG g_lastPulseTick;
 thread_local bool g_wasActive;
 
 void FlushPendingDiagnosticsReferences();
@@ -1174,6 +1181,11 @@ void Pulse() {
     }
     g_inPulse = true;
     ++g_pulseNumber;
+    LARGE_INTEGER pulseStart{};
+    QueryPerformanceCounter(&pulseStart);
+    const ULONGLONG pulseTick = GetTickCount64();
+    const ULONGLONG gap = g_lastPulseTick ? pulseTick - g_lastPulseTick : 0;
+    g_lastPulseTick = pulseTick;
     std::erase_if(g_slotCache, [](const SlotCache& cache) {
         return !IsWindow(cache.taskbar);
     });
@@ -1228,6 +1240,23 @@ void Pulse() {
     }
 
     if (active && g_surfaceState && g_surfaceWritable) {
+        LARGE_INTEGER pulseEnd{};
+        LARGE_INTEGER frequency{};
+        QueryPerformanceCounter(&pulseEnd);
+        QueryPerformanceFrequency(&frequency);
+        const LONG duration = frequency.QuadPart
+            ? static_cast<LONG>((pulseEnd.QuadPart - pulseStart.QuadPart) * 1000 / frequency.QuadPart)
+            : 0;
+        // Gaps while idle (250 ms timer) are expected; only measure while active.
+        if (g_wasActive && gap > 0 &&
+            static_cast<LONG>(std::min<ULONGLONG>(gap, LONG_MAX)) > g_surfaceState->bridgeMaxGapMs) {
+            g_surfaceState->bridgeMaxGapMs = static_cast<LONG>(std::min<ULONGLONG>(gap, LONG_MAX));
+        }
+        if (duration > g_surfaceState->bridgeSlowestPulseMs) {
+            g_surfaceState->bridgeSlowestPulseMs = duration;
+        }
+        InterlockedIncrement(&g_surfaceState->bridgePulses);
+        g_surfaceState->bridgeBuild = chameleon::kBridgeBuild;
         g_surfaceState->bridgeSurfaces = surfaces;
         g_surfaceState->bridgeTrays = trays;
         g_surfaceState->bridgeIndicators = static_cast<LONG>(indicators);

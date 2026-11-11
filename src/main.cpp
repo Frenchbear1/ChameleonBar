@@ -681,6 +681,12 @@ public:
             }
             return status;
         }
+        if (health.outdated) {
+            status.level = Level::Waiting;
+            status.headline = L"Restart Explorer to finish";
+            status.detail = L"Explorer is still running the previous bridge. Use Restart Explorer on the General page.";
+            return status;
+        }
         if (health.surfaces == 0 && publishingSince_ != 0 &&
             now - publishingSince_ > kBridgeGraceMilliseconds) {
             status.level = Level::Problem;
@@ -852,6 +858,39 @@ private:
             bridgeRetries_ = 0;
             KillTimer(controller_, kBridgeRetryTimer);
         }
+    }
+
+    // Every 10 s, write how regularly the bridge pulsed to the [diagnostics]
+    // section of settings.ini so stalls can be diagnosed after the fact.
+    void RecordBridgeTiming() {
+        const ULONGLONG now = GetTickCount64();
+        if (timingWindowStart_ == 0) {
+            timingWindowStart_ = now;
+            surfacePublisher_.TakeTiming();
+            return;
+        }
+        if (now - timingWindowStart_ < 10000) {
+            return;
+        }
+        const ULONGLONG elapsed = now - timingWindowStart_;
+        timingWindowStart_ = now;
+        const auto timing = surfacePublisher_.TakeTiming();
+        const auto health = surfacePublisher_.Health();
+        const long pulses = static_cast<long>(timing.pulses - lastPulseCount_);
+        lastPulseCount_ = timing.pulses;
+        worstGapMs_ = std::max<long>(worstGapMs_, timing.maxGapMs);
+        if (paused_ || !bridgeResult_.attached) {
+            return;
+        }
+        const std::wstring path = chameleon::SettingsPath();
+        const auto write = [&](const wchar_t* key, long long value) {
+            WritePrivateProfileStringW(L"diagnostics", key, std::to_wstring(value).c_str(), path.c_str());
+        };
+        write(L"bridge_pulses_per_second", pulses * 1000LL / static_cast<long long>(elapsed));
+        write(L"bridge_pulse_gap_max_ms", timing.maxGapMs);
+        write(L"bridge_pulse_gap_worst_ms", worstGapMs_);
+        write(L"bridge_slowest_pulse_ms", timing.slowestPulseMs);
+        write(L"bridge_heartbeat_age_ms", health.heartbeatAge);
     }
 
     bool BridgeWorking() const {
@@ -1155,6 +1194,7 @@ private:
                 if (self->settingsWindow_) {
                     self->settingsWindow_->Tick();
                 }
+                self->RecordBridgeTiming();
                 break;
             case kBridgeRetryTimer:
                 self->RetryBridge();
@@ -1232,6 +1272,9 @@ private:
     ULONGLONG bridgeAttachedAt_ = 0;
     int bridgeRetries_ = 0;
     std::atomic_bool explorerRestarting_{false};
+    ULONGLONG timingWindowStart_ = 0;
+    LONG lastPulseCount_ = 0;
+    long worstGapMs_ = 0;
 };
 
 bool RegisterWindowClasses() {

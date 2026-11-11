@@ -15,6 +15,9 @@ constexpr wchar_t kActiveEventName[] = L"Local\\ChameleonBar.Active.v5";
 constexpr wchar_t kBridgeReadyEventName[] =
     L"Local\\ChameleonBar.XamlBridgeReady.v5";
 constexpr std::uint32_t kSurfaceProtocolVersion = 3;
+// Bumped whenever bridge behavior changes without a protocol change, so the
+// app can tell when Explorer is still running an older bridge build.
+constexpr LONG kBridgeBuild = 2;
 constexpr std::size_t kMaximumTaskbars = 8;
 constexpr std::size_t kMaximumSurfacePixels = 8192;
 
@@ -67,7 +70,11 @@ struct SharedSurfaceState {
     volatile LONG bridgeSurfaces = 0;   // taskbars currently painted
     volatile LONG bridgeTrays = 0;      // system trays under contrast control
     volatile LONG bridgeIndicators = 0; // running-app underlines tracked
-    LONG bridgeReserved[4]{};
+    // Timing diagnostics. The bridge raises these; the app reads and resets.
+    volatile LONG bridgeMaxGapMs = 0;        // longest time between pulses
+    volatile LONG bridgeSlowestPulseMs = 0;  // longest single pulse
+    volatile LONG bridgePulses = 0;          // pulses since start (wraps)
+    volatile LONG bridgeBuild = 0;           // kBridgeBuild of the running bridge
 
     SharedSurfaceSlot slots[kMaximumTaskbars]{};
 };

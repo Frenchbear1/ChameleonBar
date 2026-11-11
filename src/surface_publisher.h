@@ -11,9 +11,17 @@ namespace chameleon {
 
 struct BridgeHealth {
     bool alive = false;      // the bridge pulsed recently
+    DWORD heartbeatAge = 0;  // ms since the last pulse (0 if never)
+    bool outdated = false;   // Explorer is running an older bridge build
     int surfaces = 0;        // taskbars it is painting
     int trays = 0;
     int indicators = 0;
+};
+
+struct BridgeTiming {
+    LONG maxGapMs = 0;
+    LONG slowestPulseMs = 0;
+    LONG pulses = 0;
 };
 
 // Security attributes for the shared mapping and fail-safe event. They let the
@@ -60,7 +68,14 @@ public:
 
     void SetContrast(bool enabled, int lightPercent, int darkPercent);
 
+    // A pulse every 16 ms is normal. Explorer's taskbar thread can briefly
+    // stall (sign-in, display changes, heavy load), so only a long silence
+    // counts as the bridge being gone.
+    static constexpr DWORD kAliveMilliseconds = 8000;
     BridgeHealth Health() const;
+
+    // Returns the timing measured since the previous call and resets it.
+    BridgeTiming TakeTiming();
 
 private:
     SharedSurfaceSlot* FindSlot(HWND taskbar);

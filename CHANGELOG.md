@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.1
+
+- The status card no longer flips between "Live" and "Taskbar not responding". Short pauses in Explorer's taskbar thread are tolerated; only 8 seconds of silence counts as a problem.
+- The bridge stopped re-setting running-app underline colors every frame when Windows restyles them on focus changes; it now re-applies at most once a second. This removes constant work on Explorer's taskbar thread.
+- The bridge measures how regularly it runs and how long each update takes. The app writes this to `[diagnostics]` in `settings.ini` every 10 seconds (`bridge_pulse_gap_max_ms`, `bridge_pulse_gap_worst_ms`, `bridge_slowest_pulse_ms`, `bridge_pulses_per_second`).
+- The status card says "Restart Explorer to finish" when Explorer is still running an older bridge after an update.
+
 ## 1.0
 
 ### Fixed
