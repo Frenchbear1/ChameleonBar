@@ -9,6 +9,14 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Must come before the targets: these only seed properties of targets
+# created afterwards.
+foreach(config Debug Release RelWithDebInfo MinSizeRel)
+    string(TOUPPER "${config}" config_upper)
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${config_upper}
+        "${CMAKE_BINARY_DIR}/bin/${config}")
+endforeach()
+
 add_executable(ChameleonBar WIN32
     app.rc
     src/main.cpp
@@ -60,9 +68,3 @@ if(MSVC)
         target_link_options(${target} PRIVATE /Brepro)
     endforeach()
 endif()
-
-foreach(config Debug Release RelWithDebInfo MinSizeRel)
-    string(TOUPPER "${config}" config_upper)
-    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${config_upper}
-        "${CMAKE_BINARY_DIR}/bin/${config}")
-endforeach()
