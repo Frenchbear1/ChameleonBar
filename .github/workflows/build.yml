@@ -5,6 +5,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   windows-x64:
     runs-on: windows-latest
@@ -27,3 +30,23 @@ jobs:
             Setup and Troubleshooting.txt
             LICENSE.txt
             THIRD_PARTY_NOTICES.md
+
+      # Keep ready-to-run binaries in dist/ on main. Commits made with the
+      # workflow token don't trigger another run, so this can't loop.
+      - name: Commit binaries to dist/
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp build/bin/Release/ChameleonBar.exe build/bin/Release/ChameleonBar.XamlBridge.dll dist/
+          cp "Setup and Troubleshooting.txt" dist/
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git add dist
+          if git diff --cached --quiet; then
+            echo "Binaries unchanged."
+            exit 0
+          fi
+          git commit -m "Update prebuilt binaries for ${GITHUB_SHA::7} [skip ci]"
+          git pull --rebase origin main
+          git push origin HEAD:main

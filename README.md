@@ -6,7 +6,9 @@ It is self-contained. It does not need Windhawk, TranslucentTB, a browser extens
 
 ## Run it
 
-1. Keep `ChameleonBar.exe` and `ChameleonBar.XamlBridge.dll` in the same folder.
+Ready-to-run binaries are in the [`dist/`](dist) folder. They are rebuilt and committed automatically by GitHub Actions on every push to `main`.
+
+1. Copy everything in `dist/` into one folder. `ChameleonBar.exe` and `ChameleonBar.XamlBridge.dll` must stay together.
 2. Turn off Windows 11 Taskbar Styler or any other tool that restyles the taskbar background.
 3. Open `ChameleonBar.exe`. The status card in the bottom-left corner of the window should say **Live**.
 4. Close the window. ChameleonBar keeps running in the notification area; double-click its icon to come back.

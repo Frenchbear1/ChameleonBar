@@ -54,7 +54,10 @@ add_test(NAME sampler_tests COMMAND sampler_tests)
 
 if(MSVC)
     foreach(target ChameleonBar ChameleonBarXamlBridge sampler_tests)
-        target_compile_options(${target} PRIVATE /W4 /EHsc /utf-8)
+        # /Brepro: byte-identical output for identical source, so the
+        # committed binaries in dist/ only change when the code does.
+        target_compile_options(${target} PRIVATE /W4 /EHsc /utf-8 /Brepro)
+        target_link_options(${target} PRIVATE /Brepro)
     endforeach()
 endif()
 
