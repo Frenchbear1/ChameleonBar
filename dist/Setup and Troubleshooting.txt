@@ -1,0 +1,93 @@
+CHAMELEONBAR — SETUP AND TROUBLESHOOTING
+========================================
+
+NORMAL SETUP
+------------
+1. Keep ChameleonBar.exe and ChameleonBar.XamlBridge.dll together in one
+   folder.
+2. If Windows 11 Taskbar Styler is enabled in Windhawk, disable it. Also
+   disable the old ChameleonBar Tray Contrast Windhawk companion if you
+   installed it. Only one tool should restyle the taskbar background.
+3. Open ChameleonBar.exe.
+4. The status card at the bottom-left of the window should say "Live".
+5. Close the window. ChameleonBar keeps running in the notification area.
+   Double-click its icon to open the window again.
+
+No installation, administrator access or Windhawk runtime is required.
+
+WHAT THE STATUS CARD MEANS
+--------------------------
+Live                 Everything is working.
+Connecting           ChameleonBar is loading its bridge into Explorer. This
+                     can take up to a couple of minutes right after sign-in.
+Needs attention      The bridge couldn't load. The card says why; see below.
+Taskbar not          The bridge was loaded but Explorer stopped answering.
+responding           Use General > Restart Explorer.
+Can't reach the bar  The bridge is running but couldn't find the taskbar
+                     background. Use General > Restart Explorer once.
+Paused               You paused color matching. The taskbar is back to the
+                     Windows default.
+
+IF THE BRIDGE CAN'T LOAD
+------------------------
+1. Make sure ChameleonBar.XamlBridge.dll is next to ChameleonBar.exe.
+2. Turn off any other taskbar styler (Windhawk mods, TranslucentTB, etc.).
+3. Open the window, go to General, and click "Restart Explorer". ChameleonBar
+   reconnects automatically afterwards. (Signing out and back in also works.)
+4. If you just updated ChameleonBar and the card mentions an older bridge,
+   Restart Explorer once — the old version is still loaded in Explorer.
+5. The [diagnostics] section of %LocalAppData%\ChameleonBar\settings.ini
+   records the last bridge_status and bridge_message. 0x00000000 is success.
+
+IF THE COLOR DISAPPEARS WHEN YOU OPEN START OR QUICK SETTINGS
+-------------------------------------------------------------
+This was fixed in 1.0. If you still see it, the old bridge from an earlier
+preview is probably still loaded: use General > Restart Explorer once.
+
+Note that with "Clear taskbar on an empty desktop" turned on (Look page), the
+taskbar is intentionally see-through whenever no app window is open on that
+monitor — for example after you minimize the last window. Turn it off if you
+always want color.
+
+IF TRAY TEXT OR ICONS HAVE THE WRONG COLOR
+------------------------------------------
+1. Open the Contrast page and make sure "Adaptive icon contrast" is on.
+2. Raise "Switch to light glyphs below" if dark backgrounds still get dark
+   icons. Lower "Switch back to dark glyphs above" if light backgrounds keep
+   white icons too long. The second value always stays above the first.
+
+IF TEXT, ICONS OR THIN LINES TINT THE TASKBAR
+---------------------------------------------
+1. Open the Sampling page and keep "Background colors only" on.
+2. Raise "Ignore details up to" if a wide icon or label still shows up as a
+   stripe. Lower it if you want small colored areas reproduced.
+
+Every visible app window's edges are hard boundaries, so a large value can't
+spread one window's color into its neighbour.
+
+IF THE COLOR LAGS OR USES TOO MUCH CPU
+--------------------------------------
+- For faster response: Seamless or Vivid preset, or Sampling > Update rate
+  at 16-33 ms.
+- For less CPU: Battery saver preset, or raise Update rate and Segment width.
+- For video: Cinema preset, or raise Look > Transition time.
+
+RECOVERY AND UNDO
+-----------------
+- Right-click the tray icon and choose "Exit and restore taskbar".
+- If ChameleonBar is force-closed or crashes, the bridge notices immediately
+  and restores the native taskbar on its own.
+- General > Reset everything returns all settings to their defaults.
+- No system files are changed. If Explorer misbehaves for any reason,
+  restarting Explorer or signing out restores everything.
+
+PRIVACY
+-------
+Screen sampling is local and memory-only. ChameleonBar has no networking code,
+analytics or telemetry, and never stores screenshots.
+
+SOURCE AND LICENSE
+------------------
+The project is GPL-3.0. The XAML diagnostics bridge is derived from the
+GPL-3.0 Windows 11 Taskbar Styler source by m417z/ramensoftware. See
+THIRD_PARTY_NOTICES.md and LICENSE.txt in the source package.
